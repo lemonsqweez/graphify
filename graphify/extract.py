@@ -18,6 +18,11 @@ from typing import Any, Callable
 from .cache import load_cached, save_cached
 from .mcp_ingest import extract_mcp_config, is_mcp_config_path
 from .manifest_ingest import extract_package_manifest, is_package_manifest_path
+from .salesforce_ingest import (
+    extract_salesforce_metadata,
+    is_salesforce_metadata_path,
+    resolve_salesforce_references,
+)
 from .resolver_registry import (
     LanguageResolver,
     register as register_language_resolver,
@@ -7369,6 +7374,11 @@ _KOTLIN_IMPORT_TARGET_RESOLVER = LanguageResolver(
 # registry (framework lives in graphify.resolver_registry). A new language plugs in
 # by adding one register() call below — no edits to extract()'s body. Order
 # preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
+# Salesforce: folds sourceless SObject/field stubs into their SFDX definitions.
+register_language_resolver(
+    LanguageResolver("salesforce", frozenset({".xml", ".cls", ".trigger", ".js"}),
+                     resolve_salesforce_references)
+)
 register_language_resolver(
     LanguageResolver("terraform_modules", frozenset({".tf"}), resolve_terraform_modules)
 )
@@ -8802,6 +8812,10 @@ def _get_extractor(path: Path) -> Any | None:
     # (#1377). apm.yml would otherwise be a .yml document handled by the LLM.
     if is_package_manifest_path(path):
         return extract_package_manifest
+    # Salesforce SFDX *-meta.xml (object/field/flow/permset/...) by compound
+    # suffix, before generic .xml handling.
+    if is_salesforce_metadata_path(path):
+        return extract_salesforce_metadata
     # A project-declared remap (.graphifyrc `language.inc=php`, #2961) wins
     # over every sniff below: the user has said what the extension means in
     # this repo, so a remapped `.h`/`.m` also skips the C++/ObjC probes.

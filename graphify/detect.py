@@ -526,6 +526,10 @@ def classify_file(path: Path) -> FileType | None:
     # Compound extensions must be checked before simple suffix lookup
     if path.name.lower().endswith(".blade.php"):
         return FileType.CODE
+    # Salesforce SFDX metadata (*.object-meta.xml, ...) is parsed deterministically.
+    from graphify.salesforce_ingest import is_salesforce_metadata_path
+    if is_salesforce_metadata_path(path):
+        return FileType.CODE
     # A project may declare what an ambiguous extension means to it
     # (.graphifyrc `language.inc=php`, #2961); classify by the declared one.
     ext = effective_suffix(path).lower()

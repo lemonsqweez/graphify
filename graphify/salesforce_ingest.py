@@ -1,0 +1,242 @@
+"""Salesforce SFDX metadata (``*-meta.xml``) → graph structure.
+
+Deterministic XML parse (stdlib ElementTree, no LLM); every edge is EXTRACTED.
+SObject and field node IDs are global — ``make_id(object_api)`` and
+``make_id(object_api, field_api)`` — so they converge with the SObject / field
+stubs ``extract_apex`` mints from SOQL and trigger headers, wiring Apex code to
+the schema it touches.
+
+Handles: object (incl. legacy inline fields/rules); field (Lookup / MasterDetail
+relationships); flow (record-trigger object + referenced objects);
+validationRule; permissionset (field- and object-level grants). Relation
+vocabulary: ``has_field``, ``looks_up_to``, ``master_detail_to``,
+``triggers_on``, ``references``, ``validates``, ``grants_fls``,
+``grants_access``.
+
+Code-sidecar metadata (``.cls-meta.xml``, ``.trigger-meta.xml``,
+``.js-meta.xml``) is intentionally not matched — the companion source file
+already covers it.
+"""
+from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+from graphify.ids import make_id
+
+SF_METADATA_SUFFIXES = (
+    ".object-meta.xml",
+    ".field-meta.xml",
+    ".flow-meta.xml",
+    ".validationRule-meta.xml",
+    ".permissionset-meta.xml",
+)
+
+
+def is_salesforce_metadata_path(path: Path) -> bool:
+    """True for the SFDX metadata types :func:`extract_salesforce_metadata` parses.
+
+    Matched by compound type suffix: these all share the bare ``.xml`` suffix,
+    which is otherwise unclassified, so generic XML stays untouched."""
+    name = Path(path).name
+    return any(name.endswith(suffix) for suffix in SF_METADATA_SUFFIXES)
+
+
+def _local(tag: str) -> str:
+    # Strip the {namespace} prefix ElementTree prepends to every tag.
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child_text(el, child_name: str) -> str | None:
+    for c in el:
+        if _local(c.tag) == child_name:
+            return (c.text or "").strip() or None
+    return None
+
+
+def _find_all(el, child_name: str) -> list:
+    return [c for c in el if _local(c.tag) == child_name]
+
+
+def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        root = ET.fromstring(text)
+    except (OSError, ET.ParseError):
+        return {"nodes": [], "edges": []}
+
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    def add_node(nid: str, label: str, stub: bool = False) -> None:
+        # stub=True emits a reference node with no source_file (and no
+        # origin_file), so the same object/field referenced from many files keeps
+        # one shared id. The unique-stub rewire and resolve_salesforce_references
+        # then fold it into the single real definition.
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": "" if stub else str_path, "source_location": None,
+            })
+
+    def obj_ref(obj_api: str) -> str:
+        nid = make_id(obj_api)
+        add_node(nid, obj_api, stub=True)
+        return nid
+
+    def add_edge(src: str, tgt: str, relation: str, **attrs: Any) -> None:
+        key = (src, tgt, relation)
+        if not src or not tgt or key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({
+            "source": src, "target": tgt, "relation": relation,
+            "confidence": "EXTRACTED", "source_file": str_path,
+            "source_location": None, "weight": 1.0, **attrs,
+        })
+
+    def field_node(obj_api: str, field_api: str, stub: bool) -> str:
+        f_nid = make_id(obj_api, field_api)
+        add_node(f_nid, f"{obj_api}.{field_api}", stub=stub)
+        add_edge(obj_ref(obj_api), f_nid, "has_field")
+        return f_nid
+
+    def process_field(field_el, obj_api: str, field_api: str | None = None) -> None:
+        field_api = field_api or _child_text(field_el, "fullName")
+        if not field_api:
+            return
+        f_nid = field_node(obj_api, field_api, stub=False)
+        ftype = _child_text(field_el, "type") or ""
+        if ftype in ("Lookup", "MasterDetail", "Hierarchy"):
+            relation = "master_detail_to" if ftype == "MasterDetail" else "looks_up_to"
+            for ref in _find_all(field_el, "referenceTo"):
+                target = (ref.text or "").strip()
+                if target:
+                    add_edge(f_nid, obj_ref(target), relation)
+
+    name = path.name
+
+    def strip_suffix(suffix: str) -> str:
+        return name[: -len(suffix)]
+
+    # OBJECT: objects/<Obj>/<Obj>.object-meta.xml — the object's one real definition.
+    if name.endswith(".object-meta.xml"):
+        obj_api = strip_suffix(".object-meta.xml")
+        obj_nid = make_id(obj_api)
+        add_node(obj_nid, obj_api)
+        # Decomposed SFDX keeps fields/rules in their own files; the legacy
+        # combined format inlines them.
+        for fld in _find_all(root, "fields"):
+            process_field(fld, obj_api)
+        for vr in _find_all(root, "validationRules"):
+            vr_name = _child_text(vr, "fullName")
+            if vr_name:
+                vr_nid = make_id(obj_api, "vr", vr_name)
+                add_node(vr_nid, f"{obj_api}.{vr_name}")
+                add_edge(obj_nid, vr_nid, "validates")
+
+    # FIELD: objects/<Obj>/fields/<Field>.field-meta.xml
+    elif name.endswith(".field-meta.xml"):
+        if path.parent.name == "fields":
+            process_field(root, path.parent.parent.name, strip_suffix(".field-meta.xml"))
+
+    # FLOW: flows/<Flow>.flow-meta.xml
+    elif name.endswith(".flow-meta.xml"):
+        flow_nid = make_id("flow", strip_suffix(".flow-meta.xml"))
+        add_node(flow_nid, strip_suffix(".flow-meta.xml"))
+        triggered: set[str] = set()
+        for start in _find_all(root, "start"):
+            obj = _child_text(start, "object")
+            if obj:
+                o_nid = obj_ref(obj)
+                add_edge(flow_nid, o_nid, "triggers_on")
+                triggered.add(o_nid)
+        # Objects touched by record elements (lookups/creates/updates/deletes).
+        for el in root.iter():
+            if _local(el.tag) == "object":
+                obj = (el.text or "").strip()
+                if obj and make_id(obj) not in triggered:
+                    add_edge(flow_nid, obj_ref(obj), "references")
+
+    # VALIDATION RULE: objects/<Obj>/validationRules/<R>.validationRule-meta.xml
+    elif name.endswith(".validationRule-meta.xml"):
+        if path.parent.name == "validationRules":
+            obj_api = path.parent.parent.name
+            rule_api = strip_suffix(".validationRule-meta.xml")
+            rule_nid = make_id(obj_api, "vr", rule_api)
+            add_node(rule_nid, f"{obj_api}.{rule_api}")
+            add_edge(obj_ref(obj_api), rule_nid, "validates")
+
+    # PERMISSION SET: permissionsets/<PS>.permissionset-meta.xml
+    elif name.endswith(".permissionset-meta.xml"):
+        ps_nid = make_id("permset", strip_suffix(".permissionset-meta.xml"))
+        add_node(ps_nid, strip_suffix(".permissionset-meta.xml"))
+        for fp in _find_all(root, "fieldPermissions"):
+            field_ref = _child_text(fp, "field")  # "Object.Field"
+            if field_ref and "." in field_ref:
+                obj_api, field_api = field_ref.split(".", 1)
+                add_edge(
+                    ps_nid, field_node(obj_api, field_api, stub=True), "grants_fls",
+                    readable=_child_text(fp, "readable") == "true",
+                    editable=_child_text(fp, "editable") == "true",
+                )
+        for op in _find_all(root, "objectPermissions"):
+            obj_api = _child_text(op, "object")
+            if obj_api:
+                add_edge(ps_nid, obj_ref(obj_api), "grants_access")
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
+                                  all_edges: list[dict]) -> None:
+    """Fold sourceless SObject/field stubs into their ``*-meta.xml`` definitions.
+
+    The generic unique-stub rewire already binds exact-case *object* stubs, but
+    it skips dotted labels (``Account.Industry__c``) and only case-folds for
+    case-insensitive languages. Salesforce API names are case-insensitive and
+    fields are dotted, so without this pass a field granted by a permission set
+    or read in SOQL stays a separate node from its definition (the definition's
+    id is salted apart by the per-file disambiguation). Matching is by
+    case-folded label against definitions in SFDX metadata files only, and only
+    when that definition is unique.
+    """
+    real_by_label: dict[str, list[dict]] = {}
+    for node in all_nodes:
+        src = str(node.get("source_file") or "")
+        if src and is_salesforce_metadata_path(Path(src)):
+            label = str(node.get("label", "")).strip().casefold()
+            if label:
+                real_by_label.setdefault(label, []).append(node)
+
+    remap: dict[str, str] = {}
+    for node in all_nodes:
+        if node.get("source_file"):
+            continue
+        label = str(node.get("label", "")).strip().casefold()
+        # Dot guard: an object stub (no dot) folds only into an object, a field
+        # stub (dotted) only into a field; a field never binds to its namesake object.
+        candidates = [c for c in real_by_label.get(label, [])
+                      if ("." in str(c.get("label", ""))) == ("." in label)]
+        if len(candidates) == 1 and candidates[0].get("id") != node.get("id"):
+            remap[str(node.get("id"))] = str(candidates[0]["id"])
+    if not remap:
+        return
+
+    all_nodes[:] = [n for n in all_nodes if str(n.get("id")) not in remap]
+    seen: set[tuple] = set()
+    kept: list[dict] = []
+    for edge in all_edges:
+        edge["source"] = remap.get(edge.get("source"), edge.get("source"))
+        edge["target"] = remap.get(edge.get("target"), edge.get("target"))
+        key = (edge["source"], edge["target"], edge.get("relation"), edge.get("source_file"))
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(edge)
+    all_edges[:] = kept
