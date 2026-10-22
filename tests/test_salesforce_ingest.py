@@ -210,3 +210,41 @@ def test_other_custom_metadata_ignored():
     assert is_salesforce_metadata_path(Path("Xero_Program_Mapping.Code_4010.md-meta.xml")) is False
     assert is_salesforce_metadata_path(
         Path("dlrs__LookupRollupSummary2.Acct_Lifetime.md-meta.xml")) is True
+
+
+def _labels_of_targets(r, relation, source):
+    by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    return {by_id[e["target"]] for e in r["edges"]
+            if e["relation"] == relation and e["source"] == source}
+
+
+_REGION_LABEL = make_id("Account", "Region_Label__c")
+
+
+def test_formula_reads_same_object_field():
+    r = _meta("objects/Account/fields/Region_Label__c.field-meta.xml")
+    assert make_id("Account", "Region__c") in _rel_targets(r, "reads_field", _REGION_LABEL)
+
+
+def test_formula_relationship_hop(tmp_path):
+    ext, _ = build_sfdx(tmp_path)
+    region = _by_label(ext, "Account.Region__c")
+    assert len(region) == 1 and region[0]["source_file"]
+    label_field = _by_label(ext, "Account.Region_Label__c")[0]
+    reads = {e["target"] for e in _edges(ext, "reads_field") if e["source"] == label_field["id"]}
+    assert region[0]["id"] in reads
+    assert not _by_label(ext, "Account.Parent__r.Region__c")
+
+
+def test_formula_ignores_globals_strings_comments():
+    r = _meta("objects/Account/fields/Region_Label__c.field-meta.xml")
+    labels = _labels_of_targets(r, "reads_field", _REGION_LABEL)
+    assert labels, "formula should reference fields"
+    for bad in ("$User", "West", "c", "Id"):
+        assert not [lab for lab in labels if bad in lab.split(".")], (bad, labels)
+
+
+def test_validation_rule_reads_field():
+    r = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
+    rule = make_id("Account", "vr", "Region_Required")
+    assert _rel_targets(r, "reads_field", rule) == {make_id("Account", "Region__c")}

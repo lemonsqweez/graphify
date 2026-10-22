@@ -52,6 +52,34 @@ def is_salesforce_metadata_path(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in SF_METADATA_SUFFIXES)
 
 
+_FORMULA_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+_FORMULA_STRING_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
+_FORMULA_TOKEN_RE = re.compile(r"(?<![\w$.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)(\s*\()?")
+_REL_STUB_RE = re.compile(r"^(\w+)\.(\w+__r)\.(\w+__c)$", re.I)
+_FORMULA_LITERALS = frozenset({"true", "false", "null"})
+
+
+def _formula_refs(formula: str) -> list[tuple[str | None, str]]:
+    """Custom-field references in a formula, as ``(relationship, field)`` pairs.
+
+    ``relationship`` is None for a same-object field (``Region__c``) and the
+    ``X__r`` segment for a one-hop reference (``Parent__r.Region__c``). Comments,
+    string literals, functions, ``$Global`` variables and standard relationship
+    paths (``RecordType.DeveloperName``) are skipped."""
+    text = _FORMULA_STRING_RE.sub(" ", _FORMULA_COMMENT_RE.sub(" ", formula))
+    refs: list[tuple[str | None, str]] = []
+    for m in _FORMULA_TOKEN_RE.finditer(text):
+        token, call = m.group(1), m.group(2)
+        if call or token.lower() in _FORMULA_LITERALS:
+            continue
+        parts = token.split(".")
+        if len(parts) == 1 and parts[0].lower().endswith("__c"):
+            refs.append((None, parts[0]))
+        elif len(parts) == 2 and parts[0].lower().endswith("__r") and parts[1].lower().endswith("__c"):
+            refs.append((parts[0], parts[1]))
+    return refs
+
+
 _RECORD_REF_RE = re.compile(r"^\$Record(?:__Prior)?\.(\w+)$")
 
 
@@ -118,11 +146,23 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
         add_edge(obj_ref(obj_api), f_nid, "has_field")
         return f_nid
 
+    def add_formula_refs(owner_nid: str, obj_api: str, formula: str | None) -> None:
+        for rel, fld in _formula_refs(formula or ""):
+            if rel is None:
+                add_edge(owner_nid, field_node(obj_api, fld, stub=True), "reads_field")
+            else:
+                # One-hop `Rel__r.Field__c`: resolve_salesforce_references maps the
+                # stub through the `Rel__c` lookup to the target object's field.
+                nid = make_id(obj_api, rel, fld)
+                add_node(nid, f"{obj_api}.{rel}.{fld}", stub=True)
+                add_edge(owner_nid, nid, "reads_field")
+
     def process_field(field_el, obj_api: str, field_api: str | None = None) -> None:
         field_api = field_api or _child_text(field_el, "fullName")
         if not field_api:
             return
         f_nid = field_node(obj_api, field_api, stub=False)
+        add_formula_refs(f_nid, obj_api, _child_text(field_el, "formula"))
         ftype = _child_text(field_el, "type") or ""
         if ftype in ("Lookup", "MasterDetail", "Hierarchy"):
             relation = "master_detail_to" if ftype == "MasterDetail" else "looks_up_to"
@@ -151,6 +191,7 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
                 vr_nid = make_id(obj_api, "vr", vr_name)
                 add_node(vr_nid, f"{obj_api}.{vr_name}")
                 add_edge(obj_nid, vr_nid, "validates")
+                add_formula_refs(vr_nid, obj_api, _child_text(vr, "errorConditionFormula"))
 
     # FIELD: objects/<Obj>/fields/<Field>.field-meta.xml
     elif name.endswith(".field-meta.xml"):
@@ -230,6 +271,7 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             rule_nid = make_id(obj_api, "vr", rule_api)
             add_node(rule_nid, f"{obj_api}.{rule_api}")
             add_edge(obj_ref(obj_api), rule_nid, "validates")
+            add_formula_refs(rule_nid, obj_api, _child_text(root, "errorConditionFormula"))
 
     # PERMISSION SET: permissionsets/<PS>.permissionset-meta.xml
     elif name.endswith(".permissionset-meta.xml"):
@@ -357,6 +399,29 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
                       if key.endswith(suffix) and key.count(".") == 1 for c in nodes]
         if len(candidates) == 1:
             remap[str(node.get("id"))] = str(candidates[0]["id"])
+        else:
+            dropped.add(str(node.get("id")))
+
+    # One-hop formula references `Obj.Rel__r.Field__c`: follow the `Obj.Rel__c`
+    # lookup to its target object `T` and bind to the unique field `T.Field__c`;
+    # drop the stub when the hop or the target field can't be resolved.
+    by_id = {str(n.get("id")): n for n in all_nodes}
+    lookup_target: dict[str, str] = {}
+    for edge in all_edges:
+        if edge.get("relation") in ("looks_up_to", "master_detail_to"):
+            tgt = by_id.get(str(edge.get("target")))
+            if tgt is not None:
+                lookup_target.setdefault(str(edge.get("source")), str(tgt.get("label", "")))
+    for node in all_nodes:
+        m = _REL_STUB_RE.match(str(node.get("label", "")).strip())
+        if node.get("source_file") or not m:
+            continue
+        obj, rel, fld = m.groups()
+        rel_field = real_by_label.get(f"{obj}.{rel[:-3]}__c".casefold(), [])
+        target_obj = lookup_target.get(str(rel_field[0].get("id"))) if len(rel_field) == 1 else None
+        hit = real_by_label.get(f"{target_obj}.{fld}".casefold(), []) if target_obj else []
+        if len(hit) == 1:
+            remap[str(node.get("id"))] = str(hit[0]["id"])
         else:
             dropped.add(str(node.get("id")))
     if not remap and not dropped:
