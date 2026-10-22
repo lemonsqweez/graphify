@@ -9,5 +9,13 @@
         <allowRead>true</allowRead>
         <object>Account</object>
     </objectPermissions>
+    <recordTypeVisibilities>
+        <recordType>Opportunity.Volume_Recurring</recordType>
+        <visible>true</visible>
+    </recordTypeVisibilities>
+    <classAccesses>
+        <apexClass>PaymentWorkspaceController</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
     <label>Fundraising Full Access</label>
 </PermissionSet>

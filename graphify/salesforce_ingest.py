@@ -32,7 +32,13 @@ SF_METADATA_SUFFIXES = (
     ".flow-meta.xml",
     ".validationRule-meta.xml",
     ".permissionset-meta.xml",
+    ".recordType-meta.xml",
 )
+
+# Only DLRS rollup records are custom metadata worth parsing; other CMDT types
+# (e.g. mapping tables) share the .md-meta.xml suffix and are ignored.
+_DLRS_PREFIX = "dlrs__LookupRollupSummary2."
+_XSI_NIL = "{http://www.w3.org/2001/XMLSchema-instance}nil"
 
 
 def is_salesforce_metadata_path(path: Path) -> bool:
@@ -41,6 +47,8 @@ def is_salesforce_metadata_path(path: Path) -> bool:
     Matched by compound type suffix: these all share the bare ``.xml`` suffix,
     which is otherwise unclassified, so generic XML stays untouched."""
     name = Path(path).name
+    if name.startswith(_DLRS_PREFIX) and name.endswith(".md-meta.xml"):
+        return True
     return any(name.endswith(suffix) for suffix in SF_METADATA_SUFFIXES)
 
 
@@ -240,6 +248,65 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             obj_api = _child_text(op, "object")
             if obj_api:
                 add_edge(ps_nid, obj_ref(obj_api), "grants_access")
+        for rv in _find_all(root, "recordTypeVisibilities"):
+            rt_ref = _child_text(rv, "recordType")  # "Object.DeveloperName"
+            if rt_ref and "." in rt_ref and _child_text(rv, "visible") == "true":
+                obj_api, rt_api = rt_ref.split(".", 1)
+                rt_nid = make_id(obj_api, "rt", rt_api)
+                add_node(rt_nid, rt_ref, stub=True)
+                add_edge(ps_nid, rt_nid, "grants_record_type")
+        for ca in _find_all(root, "classAccesses"):
+            cls_api = _child_text(ca, "apexClass")
+            if cls_api and _child_text(ca, "enabled") == "true":
+                cls_nid = make_id(cls_api)
+                add_node(cls_nid, cls_api, stub=True)  # the generic rewire folds it into the class
+                add_edge(ps_nid, cls_nid, "grants_apex")
+
+    # RECORD TYPE: objects/<Obj>/recordTypes/<RT>.recordType-meta.xml
+    elif name.endswith(".recordType-meta.xml"):
+        if path.parent.name == "recordTypes":
+            obj_api = path.parent.parent.name
+            rt_api = strip_suffix(".recordType-meta.xml")
+            rt_nid = make_id(obj_api, "rt", rt_api)
+            add_node(rt_nid, f"{obj_api}.{rt_api}")
+            picklists: dict[str, list[str]] = {}
+            for pv in _find_all(root, "picklistValues"):
+                picklist = _child_text(pv, "picklist")
+                if picklist:
+                    picklists[picklist] = [
+                        v for v in (_child_text(val, "fullName") for val in _find_all(pv, "values")) if v
+                    ]
+            nodes[-1]["picklists"] = picklists
+            nodes[-1]["business_process"] = _child_text(root, "businessProcess")
+            add_edge(obj_ref(obj_api), rt_nid, "has_record_type")
+
+    # DLRS ROLLUP: customMetadata/dlrs__LookupRollupSummary2.<Name>.md-meta.xml
+    elif name.startswith(_DLRS_PREFIX) and name.endswith(".md-meta.xml"):
+        rollup_api = name[len(_DLRS_PREFIX): -len(".md-meta.xml")]
+        values: dict[str, str | None] = {}
+        for v in _find_all(root, "values"):
+            key = _child_text(v, "field")
+            val_el = next((c for c in v if _local(c.tag) == "value"), None)
+            if key and val_el is not None and val_el.get(_XSI_NIL) != "true":
+                values[key] = (val_el.text or "").strip() or None
+            elif key:
+                values[key] = None
+        roll_nid = make_id("rollup", rollup_api)
+        add_node(roll_nid, rollup_api)
+        nodes[-1]["operation"] = values.get("dlrs__AggregateOperation__c")
+        nodes[-1]["active"] = values.get("dlrs__Active__c") == "true"
+        nodes[-1]["criteria"] = values.get("dlrs__RelationshipCriteria__c")
+        parent = values.get("dlrs__ParentObject__c")
+        child = values.get("dlrs__ChildObject__c")
+        if child and values.get("dlrs__FieldToAggregate__c"):
+            add_edge(roll_nid, field_node(child, values["dlrs__FieldToAggregate__c"], stub=True),
+                     "reads_field")
+        if parent and values.get("dlrs__AggregateResultField__c"):
+            add_edge(roll_nid, field_node(parent, values["dlrs__AggregateResultField__c"], stub=True),
+                     "writes_field")
+        if child and values.get("dlrs__RelationshipField__c"):
+            add_edge(roll_nid, field_node(child, values["dlrs__RelationshipField__c"], stub=True),
+                     "references")
 
     return {"nodes": nodes, "edges": edges}
 

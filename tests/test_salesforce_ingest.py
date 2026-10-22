@@ -8,7 +8,7 @@ from graphify.build import build_from_json
 from graphify.detect import FileType, classify_file
 from graphify.extract import _get_extractor, extract
 from graphify.ids import make_id
-from graphify.salesforce_ingest import extract_salesforce_metadata
+from graphify.salesforce_ingest import extract_salesforce_metadata, is_salesforce_metadata_path
 
 SFDX_FIXTURE = Path(__file__).parent / "fixtures" / "sfdx"
 
@@ -164,3 +164,49 @@ def test_flow_reads_lookup_filter():
 
 def test_flow_split_tag_parsed():
     assert make_id("Opportunity", "StageName") in _rel_targets(_flow(), "reads_field")
+
+
+def _meta(rel):
+    return extract_salesforce_metadata(_one_file(rel))
+
+
+def test_record_type_node_and_picklists():
+    r = _meta("objects/Opportunity/recordTypes/Volume_Recurring.recordType-meta.xml")
+    rt = next(n for n in r["nodes"] if n["id"] == make_id("Opportunity", "rt", "Volume_Recurring"))
+    assert rt["label"] == "Opportunity.Volume_Recurring"
+    assert rt["picklists"] == {"StageName": ["Pledged", "Closed Won"]}
+    assert rt["business_process"] == "Volume_Process"
+    assert any(e["relation"] == "has_record_type" and e["target"] == rt["id"] for e in r["edges"])
+
+
+def test_permset_grants_record_type():
+    r = _meta("permissionsets/Fundraising_Full_Access.permissionset-meta.xml")
+    assert make_id("Opportunity", "rt", "Volume_Recurring") in _rel_targets(r, "grants_record_type")
+
+
+def test_permset_grants_apex_folds_to_class(tmp_path):
+    cls = ("public class PaymentWorkspaceController {\n"
+           "  public static void getWorkspace() {}\n}\n")
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/PaymentWorkspaceController.cls": cls})
+    classes = _by_label(ext, "PaymentWorkspaceController")
+    assert len(classes) == 1 and classes[0]["source_file"].endswith(".cls")
+    assert [e["target"] for e in _edges(ext, "grants_apex")] == [classes[0]["id"]]
+
+
+def test_dlrs_rollup_edges():
+    r = _meta("customMetadata/dlrs__LookupRollupSummary2.Acct_Lifetime.md-meta.xml")
+    roll = next(n for n in r["nodes"] if n["id"] == make_id("rollup", "Acct_Lifetime"))
+    assert roll["label"] == "Acct_Lifetime"
+    assert roll["active"] is True and roll["operation"] == "Sum" and roll["criteria"] is None
+    assert _rel_targets(r, "reads_field") == {
+        make_id("tccxero__Invoice_Line_Item__c", "tccxero__Total_Amount__c")}
+    assert _rel_targets(r, "writes_field") == {
+        make_id("Account", "Total_Lifetime_Giving_Invoiced__c")}
+    assert make_id("tccxero__Invoice_Line_Item__c", "Account__c") in _rel_targets(r, "references")
+
+
+def test_other_custom_metadata_ignored():
+    assert is_salesforce_metadata_path(Path("Xero_Program_Mapping.Code_4010.md-meta.xml")) is False
+    assert is_salesforce_metadata_path(
+        Path("dlrs__LookupRollupSummary2.Acct_Lifetime.md-meta.xml")) is True

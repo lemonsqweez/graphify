@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<RecordType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Volume_Recurring</fullName>
+    <active>true</active>
+    <businessProcess>Volume_Process</businessProcess>
+    <label>Volume Recurring</label>
+    <picklistValues>
+        <picklist>StageName</picklist>
+        <values>
+            <fullName>Pledged</fullName>
+            <default>false</default>
+        </values>
+        <values>
+            <fullName>Closed Won</fullName>
+            <default>false</default>
+        </values>
+    </picklistValues>
+</RecordType>
