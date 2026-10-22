@@ -112,11 +112,29 @@ def extract_apex(path: Path) -> dict:
     # for field read/write edges.
     line_src: list[str] = [file_nid] * (len(lines) + 2)
     current_method_nid: str | None = None
+    test_class_nid: str | None = None
+    test_class_name: str | None = None
+    seen_tests: set[tuple[str, str]] = set()
+    tested_re = _re.compile(r"\bnew\s+([A-Z]\w*)\s*\(|\b([A-Z]\w*)\s*\.\s*\w+\s*\(")
 
     for lineno, line_text in enumerate(lines, start=1):
         line_owner[lineno] = current_class_nid or file_nid
         line_src[lineno] = current_method_nid or current_class_nid or file_nid
         stripped = line_text.strip()
+
+        # In an @isTest class, every capitalized type it instantiates or calls a
+        # static member on is a candidate subject under test. Targets that don't
+        # resolve to an Apex class (System, Test, SObjects) are pruned by
+        # resolve_salesforce_references.
+        if test_class_nid is not None and not stripped.startswith(("//", "/*", "*")):
+            for tm_ in tested_re.finditer(stripped):
+                tname = tm_.group(1) or tm_.group(2)
+                if tname == test_class_name or (test_class_nid, tname) in seen_tests:
+                    continue
+                seen_tests.add((test_class_nid, tname))
+                t_nid = _make_id(tname)
+                add_node(t_nid, tname, lineno, stub=True)
+                add_edge(test_class_nid, t_nid, "tests", lineno, confidence="INFERRED")
 
         if stripped.startswith("@"):
             for m in annotation_re.finditer(stripped):
@@ -148,6 +166,11 @@ def extract_apex(path: Path) -> dict:
                 continue
             class_nid = _make_id(stem, class_name)
             add_node(class_nid, class_name, lineno)
+            if "istest" in pending_annotations:
+                nodes[-1]["is_test"] = True
+                test_class_nid, test_class_name = class_nid, class_name
+            else:
+                test_class_nid = test_class_name = None
             add_edge(file_nid, class_nid, "contains", lineno)
             if cm.group(2):
                 base = cm.group(2).strip()

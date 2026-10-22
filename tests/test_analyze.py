@@ -895,3 +895,15 @@ def test_surprise_score_normalizes_backslash_paths():
 def test_surprise_score_ignores_leading_dot_slash():
     assert _cross_reasons("./pkg/a.py", "b.py")
     assert not _cross_reasons("./a.py", "b.py")
+
+
+def test_god_nodes_skip_tests():
+    G = nx.Graph()
+    G.add_node("t", label="BigTest", source_file="a.cls", is_test=True)
+    G.add_node("h", label="Handler", source_file="b.cls")
+    for i in range(5):
+        G.add_node(f"n{i}", label=f"N{i}", source_file="c.cls")
+        G.add_edge("t", f"n{i}")
+    G.add_edge("h", "n0")
+    labels = [n["label"] for n in god_nodes(G, top_n=10)]
+    assert "BigTest" not in labels and "Handler" in labels

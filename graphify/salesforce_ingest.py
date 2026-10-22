@@ -353,6 +353,34 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
     return {"nodes": nodes, "edges": edges}
 
 
+def _prune_test_edges(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """Keep a ``tests`` edge only when it lands on an Apex class or trigger.
+
+    ``extract_apex`` emits one per capitalized type a test class touches; after
+    the generic stub rewire those naming real Apex classes point at the class node,
+    while ``System``/``Test`` and SObjects (``new Account(...)``) are not code under
+    test, so their edges are dropped, and then any stub left with no edge."""
+    by_id = {str(n.get("id")): n for n in all_nodes}
+
+    def is_apex(node: dict | None) -> bool:
+        return node is not None and str(node.get("source_file") or "").endswith((".cls", ".trigger"))
+
+    dropped_targets: set[str] = set()
+    kept: list[dict] = []
+    for edge in all_edges:
+        if edge.get("relation") == "tests" and not is_apex(by_id.get(str(edge.get("target")))):
+            dropped_targets.add(str(edge.get("target")))
+            continue
+        kept.append(edge)
+    if len(kept) == len(all_edges):
+        return
+    all_edges[:] = kept
+    linked = {str(e.get("source")) for e in kept} | {str(e.get("target")) for e in kept}
+    orphans = {t for t in dropped_targets
+               if t not in linked and not (by_id.get(t) or {}).get("source_file")}
+    all_nodes[:] = [n for n in all_nodes if str(n.get("id")) not in orphans]
+
+
 _LWC_APEX_IMPORT_RE = re.compile(r"@salesforce/apex/(\w+)\.(\w+)")
 
 
@@ -420,6 +448,7 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
     when that definition is unique.
     """
     _link_lwc_to_apex(all_nodes, all_edges)
+    _prune_test_edges(all_nodes, all_edges)
     real_by_label: dict[str, list[dict]] = {}
     for node in all_nodes:
         src = str(node.get("source_file") or "")

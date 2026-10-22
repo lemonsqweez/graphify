@@ -138,6 +138,8 @@ def god_nodes(G: nx.Graph, top_n: int = 10,
             continue
         if G.nodes[node_id].get("label", "") in _BUILTIN_NOISE_LABELS:
             continue
+        if G.nodes[node_id].get("is_test"):  # test classes aren't core abstractions
+            continue
         result.append({
             "id": node_id,
             "label": G.nodes[node_id].get("label", node_id),

@@ -37,6 +37,18 @@ DEFAULT_AFFECTED_RELATIONS = (
     # its defining file and then continues through `imports` to consumers.
     "defines",
     "requires",
+    # Salesforce (SFDX) relations: field-level reads/writes, SOQL, automation,
+    # schema links, LWC->Apex calls and test coverage, so `affected Obj.Field`
+    # reaches the code, flows and tests that touch it.
+    "queries",
+    "writes_field",
+    "reads_field",
+    "triggers_on",
+    "has_field",
+    "looks_up_to",
+    "master_detail_to",
+    "calls_apex",
+    "tests",
 )
 
 

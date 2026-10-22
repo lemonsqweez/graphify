@@ -81,3 +81,14 @@ def test_community_member_sigs_change_when_membership_changes():
     before = community_member_sigs({0: ["x", "y", "z"]})
     after = community_member_sigs({0: ["x", "y"]})  # a node left the community
     assert before[0] != after[0], "signature must change when a community's members change"
+
+
+def test_hub_label_skips_tests():
+    # 't' (degree 4) outranks 'h' (degree 3), so only the is_test skip lets 'h' win.
+    g = _g({"t": "BigTest", "h": "Handler", "a": "A", "b": "B", "c": "C"},
+           [("t", "a"), ("t", "b"), ("t", "h"), ("t", "c"), ("h", "a"), ("h", "b")])
+    g.nodes["t"]["is_test"] = True
+    labels = label_communities_by_hub(g, {0: ["t", "h", "a", "b", "c"]})
+    assert labels[0] == "Handler"
+    only_tests = label_communities_by_hub(g, {0: ["t"]})
+    assert only_tests[0] == "BigTest"

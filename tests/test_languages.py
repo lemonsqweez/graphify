@@ -4511,6 +4511,16 @@ def test_apex_no_dangling_edges():
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
 
 
+def test_apex_is_test_flag(tmp_path):
+    src = tmp_path / "T.cls"
+    src.write_text("@isTest\nprivate class HandlerTest {\n}\npublic class Handler {\n}\n",
+                   encoding="utf-8")
+    r = extract_apex(src)
+    flags = {n["label"]: n.get("is_test") for n in r["nodes"]}
+    assert flags["HandlerTest"] is True
+    assert not flags["Handler"]
+
+
 def _apex_field_edges(tmp_path, body, relation):
     """Extract a one-method Apex class and return {target id} for ``relation``."""
     src = tmp_path / "C.cls"

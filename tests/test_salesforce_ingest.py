@@ -287,3 +287,29 @@ def test_lwc_unknown_method_falls_back_to_class(tmp_path):
     by_id = {n["id"]: n for n in ext["nodes"]}
     calls = _edges(ext, "calls_apex")
     assert [by_id[e["target"]]["label"] for e in calls] == ["PaymentWorkspaceController"]
+
+
+_HANDLER_CLS = "public class Handler {\n  public static void run() {}\n}\n"
+_HANDLER_TEST_CLS = (
+    "@isTest\nprivate class HandlerTest {\n"
+    "  @isTest\n  static void t() {\n    Handler.run();\n    System.assert(true);\n"
+    "    Account a = new Account(Name = 'x');\n  }\n}\n")
+
+
+def test_tests_edge_resolves_to_class(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/Handler.cls": _HANDLER_CLS,
+        "force-app/main/default/classes/HandlerTest.cls": _HANDLER_TEST_CLS,
+    })
+    handler = [n for n in _by_label(ext, "Handler") if n["source_file"].endswith("Handler.cls")]
+    assert len(handler) == 1
+    tests = _edges(ext, "tests")
+    assert [e["target"] for e in tests] == [handler[0]["id"]]
+    assert not _by_label(ext, "System")
+
+
+def test_affected_includes_sf_relations():
+    from graphify.affected import DEFAULT_AFFECTED_RELATIONS
+    for rel in ("queries", "writes_field", "reads_field", "triggers_on", "has_field",
+                "looks_up_to", "master_detail_to", "calls_apex", "tests"):
+        assert rel in DEFAULT_AFFECTED_RELATIONS, rel

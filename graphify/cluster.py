@@ -201,7 +201,9 @@ def label_communities_by_hub(
             labels[cid] = f"Community {cid}"
             continue
         # highest degree wins; ties broken by node id (ascending) for determinism
-        hub = min(present, key=lambda n: (-G.degree(n), str(n)))
+        # Test classes (`is_test`) never name a community unless it holds only tests.
+        candidates = [n for n in present if not G.nodes[n].get("is_test")] or present
+        hub = min(candidates, key=lambda n: (-G.degree(n), str(n)))
         name = str(G.nodes[hub].get("label") or hub).strip()
         if name.endswith("()"):
             name = name[:-2]
