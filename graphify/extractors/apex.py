@@ -108,9 +108,14 @@ def extract_apex(path: Path) -> dict:
     # Owner (enclosing class/trigger, else the file) of each line, so SOQL
     # matched over the whole source afterwards attributes to the right class.
     line_owner: list[str] = [file_nid] * (len(lines) + 2)
+    # Innermost owner (open method, else class/trigger, else file) of each line,
+    # for field read/write edges.
+    line_src: list[str] = [file_nid] * (len(lines) + 2)
+    current_method_nid: str | None = None
 
     for lineno, line_text in enumerate(lines, start=1):
         line_owner[lineno] = current_class_nid or file_nid
+        line_src[lineno] = current_method_nid or current_class_nid or file_nid
         stripped = line_text.strip()
 
         if stripped.startswith("@"):
@@ -131,6 +136,7 @@ def extract_apex(path: Path) -> dict:
             add_node(sob_nid, sobject, lineno, stub=True)
             add_edge(trig_nid, sob_nid, "triggers_on", lineno)
             current_class_nid = trig_nid
+            current_method_nid = None
             pending_annotations = []
             continue
 
@@ -162,6 +168,7 @@ def extract_apex(path: Path) -> dict:
                             add_node(iface_nid, iface, lineno)
                         add_edge(class_nid, iface_nid, "implements", lineno, confidence="INFERRED")
             current_class_nid = class_nid
+            current_method_nid = None
             pending_annotations = []
             continue
 
@@ -173,6 +180,7 @@ def extract_apex(path: Path) -> dict:
                 continue
             iface_nid = _make_id(stem, iface_name)
             add_node(iface_nid, iface_name, lineno)
+            current_method_nid = None
             add_edge(file_nid if current_class_nid is None else current_class_nid,
                      iface_nid, "contains", lineno)
             if im.group(2):
@@ -196,6 +204,7 @@ def extract_apex(path: Path) -> dict:
                 continue
             enum_nid = _make_id(stem, enum_name)
             add_node(enum_nid, enum_name, lineno)
+            current_method_nid = None
             add_edge(file_nid if current_class_nid is None else current_class_nid,
                      enum_nid, "contains", lineno)
             pending_annotations = []
@@ -210,6 +219,8 @@ def extract_apex(path: Path) -> dict:
                     method_label = f".{method_name}()"
                     add_node(method_nid, method_label, lineno)
                     add_edge(current_class_nid, method_nid, "method", lineno)
+                    current_method_nid = method_nid
+                    line_src[lineno] = method_nid
                     if "auraenabled" in pending_annotations or "invocablemethod" in pending_annotations:
                         add_edge(file_nid, method_nid, "contains", lineno, confidence="INFERRED")
                     pending_annotations = []
@@ -271,5 +282,71 @@ def extract_apex(path: Path) -> dict:
                 f_nid = _make_id(outer_obj, field)
                 add_node(f_nid, f"{outer_obj}.{field}", lineno, stub=True)
                 soql_edge(src, f_nid, "reads_field", lineno)
+
+    # --- Custom-field reads/writes outside SOQL ---------------------------------
+    # Bind each `var.Field__c` / `new Type(Field__c = ...)` to its SObject. The
+    # type comes from the nearest preceding declaration of `var`; with none, the
+    # edge targets an unresolved `*.Field__c` stub that resolve_salesforce_references
+    # binds only when exactly one object defines that field name.
+    decl_res = (
+        _re.compile(r"\b(?:List|Set)<\s*(\w+)\s*>\s+(\w+)"),
+        _re.compile(r"\bMap<\s*\w+\s*,\s*(\w+)\s*>\s+(\w+)"),
+        _re.compile(r"\b(\w+__c|Account|Contact|Opportunity|Lead|Campaign|Case|User)\s+(\w+)\s*[=;:,)]"),
+        _re.compile(r"\bfor\s*\(\s*(\w+)\s+(\w+)\s*:"),
+    )
+    decls: list[tuple[int, str, str]] = []  # (offset, var, type)
+    for dre in decl_res:
+        for dm in dre.finditer(source):
+            decls.append((dm.start(), dm.group(2), dm.group(1)))
+
+    def declared_type(var: str, offset: int) -> str | None:
+        best: tuple[int, str] | None = None
+        for off, v, t in decls:
+            if v == var and off < offset and (best is None or off > best[0]):
+                best = (off, t)
+        return best[1] if best else None
+
+    soql_spans = [m.span() for rx in (soql_static_re, soql_string_re)
+                  for m in rx.finditer(source)]
+
+    def in_soql(pos: int) -> bool:
+        return any(a <= pos < b for a, b in soql_spans)
+
+    # (source nid, target nid) -> (relation, line); a write beats a read.
+    field_edges: dict[tuple[str, str], tuple[str, int]] = {}
+
+    def field_edge(src: str, obj: str | None, field: str, relation: str, line: int) -> None:
+        if obj:
+            tgt, label = _make_id(obj, field), f"{obj}.{field}"
+        else:
+            tgt, label = _make_id("sf_unresolved_field", field), f"*.{field}"
+        add_node(tgt, label, line, stub=True)
+        prev = field_edges.get((src, tgt))
+        if prev is None or (relation == "writes_field" and prev[0] != "writes_field"):
+            field_edges[(src, tgt)] = (relation, line)
+
+    def src_at(pos: int) -> tuple[str, int]:
+        ln = source.count("\n", 0, pos) + 1
+        return line_src[min(ln, len(line_src) - 1)], ln
+
+    ctor_re = _re.compile(r"\bnew\s+(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
+    ctor_field_re = _re.compile(r"(?<![\w.])(\w+__c)\s*=(?!=)", _re.IGNORECASE)
+    for cm_ in ctor_re.finditer(source):
+        for fm in ctor_field_re.finditer(cm_.group(2)):
+            src, ln = src_at(cm_.start())
+            field_edge(src, cm_.group(1), fm.group(1), "writes_field", ln)
+
+    access_re = _re.compile(r"(?<![\w.])(\w+)(?:\[[^\]]*\])?\.(\w+__c)\b", _re.IGNORECASE)
+    for am in access_re.finditer(source):
+        var, field = am.group(1), am.group(2)
+        if in_soql(am.start()) or var.lower().endswith("__r"):
+            continue
+        is_write = _re.match(r"\s*=(?!=)", source[am.end():]) is not None
+        src, ln = src_at(am.start())
+        field_edge(src, declared_type(var, am.start()), field,
+                   "writes_field" if is_write else "reads_field", ln)
+
+    for (src, tgt), (relation, ln) in field_edges.items():
+        add_edge(src, tgt, relation, ln, confidence="INFERRED")
 
     return {"nodes": nodes, "edges": edges}

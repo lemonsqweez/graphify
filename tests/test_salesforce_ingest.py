@@ -94,3 +94,27 @@ def test_field_stub_never_binds_object(tmp_path):
     ids |= {n["id"] for n in _by_label(ext, "npe01__OppPayment__c.Revenue_Period__c")}
     ids |= {n["id"] for n in _by_label(ext, "tccxero__Invoice_Line_Item__c.Revenue_Period__c")}
     assert len(ids) == 3
+
+
+def _apex_class(body: str) -> str:
+    return "public class Svc {\n  public void run() {\n" + body + "\n  }\n}\n"
+
+
+def test_unresolved_field_unique_binds(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/Svc.cls": _apex_class("    Object x = rec.Region__c;"),
+    })
+    real = _by_label(ext, "Account.Region__c")
+    assert len(real) == 1 and real[0]["source_file"]
+    assert [e["target"] for e in _edges(ext, "reads_field")] == [real[0]["id"]]
+    assert not _by_label(ext, "*.Region__c")
+
+
+def test_unresolved_field_ambiguous_dropped(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/Svc.cls": _apex_class("    rec.Revenue_Period__c = x;"),
+    })
+    assert not _by_label(ext, "*.Revenue_Period__c")
+    obj_id = _by_label(ext, "Revenue_Period__c")[0]["id"]
+    assert not [e for e in _edges(ext, "writes_field") if e["target"] == obj_id]
+    assert not _edges(ext, "writes_field")

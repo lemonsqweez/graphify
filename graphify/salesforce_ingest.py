@@ -225,10 +225,29 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
                       if ("." in str(c.get("label", ""))) == ("." in label)]
         if len(candidates) == 1 and candidates[0].get("id") != node.get("id"):
             remap[str(node.get("id"))] = str(candidates[0]["id"])
-    if not remap:
+
+    # Apex field accesses whose object could not be typed are `*.Field__c` stubs.
+    # Bind one only when exactly one SFDX object defines that field name;
+    # an ambiguous name is dropped, never guessed.
+    dropped: set[str] = set()
+    for node in all_nodes:
+        label = str(node.get("label", "")).strip()
+        if node.get("source_file") or not label.startswith("*."):
+            continue
+        suffix = label[1:].casefold()  # ".field__c"
+        candidates = [c for key, nodes in real_by_label.items()
+                      if key.endswith(suffix) and key.count(".") == 1 for c in nodes]
+        if len(candidates) == 1:
+            remap[str(node.get("id"))] = str(candidates[0]["id"])
+        else:
+            dropped.add(str(node.get("id")))
+    if not remap and not dropped:
         return
 
-    all_nodes[:] = [n for n in all_nodes if str(n.get("id")) not in remap]
+    all_nodes[:] = [n for n in all_nodes
+                    if str(n.get("id")) not in remap and str(n.get("id")) not in dropped]
+    all_edges[:] = [e for e in all_edges
+                    if e.get("source") not in dropped and e.get("target") not in dropped]
     seen: set[tuple] = set()
     kept: list[dict] = []
     for edge in all_edges:

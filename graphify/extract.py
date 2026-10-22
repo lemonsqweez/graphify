@@ -3955,6 +3955,11 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         stub_id = str(stub.get("id", ""))
         if not stub_id:
             continue
+        # `*.Field__c` is an Apex field access with no known SObject. Its
+        # normalized key equals the bare name, so it would bind to an object of
+        # the same name (`Revenue_Period__c`); resolve_salesforce_references owns it.
+        if str(stub.get("label", "")).startswith("*."):
+            continue
         candidates = real_by_label.get(_node_label_key(stub), [])
         if len(candidates) > 1 and all(
             _lang_family(c.get("source_file")) == "rust" for c in candidates

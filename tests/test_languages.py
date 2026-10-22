@@ -4511,6 +4511,76 @@ def test_apex_no_dangling_edges():
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
 
 
+def _apex_field_edges(tmp_path, body, relation):
+    """Extract a one-method Apex class and return {target id} for ``relation``."""
+    src = tmp_path / "C.cls"
+    src.write_text("public class C {\n  public void run() {\n" + body + "\n  }\n}\n",
+                   encoding="utf-8")
+    r = extract_apex(src)
+    return {e["target"] for e in r["edges"] if e["relation"] == relation}, r
+
+
+_PAY_REV = _make_id("npe01__OppPayment__c", "Revenue_Period__c")
+
+
+def test_apex_field_write_constructor(tmp_path):
+    t, _ = _apex_field_edges(
+        tmp_path,
+        "    npe01__OppPayment__c p = new npe01__OppPayment__c(Id = p.Id, Revenue_Period__c = periodId);",
+        "writes_field")
+    assert _PAY_REV in t
+
+
+def test_apex_field_write_declared_var(tmp_path):
+    t, _ = _apex_field_edges(
+        tmp_path,
+        "    npe01__OppPayment__c upd = x;\n    upd.Revenue_Period__c = y;", "writes_field")
+    assert _PAY_REV in t
+
+
+def test_apex_field_write_list_index(tmp_path):
+    t, _ = _apex_field_edges(
+        tmp_path,
+        "    List<npe01__OppPayment__c> ups = x;\n    ups[i].Revenue_Period__c = y;", "writes_field")
+    assert _PAY_REV in t
+
+
+def test_apex_field_write_for_var(tmp_path):
+    t, _ = _apex_field_edges(
+        tmp_path,
+        "    for (Payment_Schedule_Line__c l : lines) { l.Status__c = 'X'; }", "writes_field")
+    assert _make_id("Payment_Schedule_Line__c", "Status__c") in t
+
+
+def test_apex_field_read_dotted(tmp_path):
+    t, r = _apex_field_edges(tmp_path, "    Id x = rec.Volume_Comm_Status__c;", "reads_field")
+    nid = _make_id("sf_unresolved_field", "Volume_Comm_Status__c")
+    assert nid in t
+    assert next(n for n in r["nodes"] if n["id"] == nid)["label"] == "*.Volume_Comm_Status__c"
+
+
+def test_apex_write_preferred_over_read(tmp_path):
+    body = "    Object a = p.Volume_Comm_Status__c;\n    p.Volume_Comm_Status__c = 'X';"
+    src = tmp_path / "C.cls"
+    src.write_text("public class C {\n  public void run() {\n" + body + "\n  }\n}\n",
+                   encoding="utf-8")
+    r = extract_apex(src)
+    nid = _make_id("sf_unresolved_field", "Volume_Comm_Status__c")
+    rels = {e["relation"] for e in r["edges"] if e["target"] == nid}
+    assert "writes_field" in rels
+
+
+def test_apex_field_edge_source_is_method(tmp_path):
+    src = tmp_path / "C.cls"
+    src.write_text("public class C {\n  public void run() {\n    p.Region__c = 'X';\n  }\n}\n",
+                   encoding="utf-8")
+    r = extract_apex(src)
+    by_id = {n["id"]: n for n in r["nodes"]}
+    e = next(e for e in r["edges"] if e["relation"] == "writes_field")
+    assert by_id[e["source"]]["label"] == ".run()"
+    assert e["confidence"] == "INFERRED"
+
+
 # -- SystemVerilog -------------------------------------------------------------
 
 @pytest.mark.parametrize("suffix", [".v", ".sv", ".svh", ".vh"])
