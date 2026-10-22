@@ -100,13 +100,18 @@ def _apex_class(body: str) -> str:
     return "public class Svc {\n  public void run() {\n" + body + "\n  }\n}\n"
 
 
+def _svc_edges(ext, relation):
+    """Edges of ``relation`` produced by the Svc.cls Apex class (not by other fixtures)."""
+    return [e for e in _edges(ext, relation) if str(e.get("source_file", "")).endswith("Svc.cls")]
+
+
 def test_unresolved_field_unique_binds(tmp_path):
     ext, _ = build_sfdx(tmp_path, {
         "force-app/main/default/classes/Svc.cls": _apex_class("    Object x = rec.Region__c;"),
     })
     real = _by_label(ext, "Account.Region__c")
     assert len(real) == 1 and real[0]["source_file"]
-    assert [e["target"] for e in _edges(ext, "reads_field")] == [real[0]["id"]]
+    assert [e["target"] for e in _svc_edges(ext, "reads_field")] == [real[0]["id"]]
     assert not _by_label(ext, "*.Region__c")
 
 
@@ -116,5 +121,46 @@ def test_unresolved_field_ambiguous_dropped(tmp_path):
     })
     assert not _by_label(ext, "*.Revenue_Period__c")
     obj_id = _by_label(ext, "Revenue_Period__c")[0]["id"]
-    assert not [e for e in _edges(ext, "writes_field") if e["target"] == obj_id]
-    assert not _edges(ext, "writes_field")
+    assert not [e for e in _svc_edges(ext, "writes_field") if e["target"] == obj_id]
+    assert not _svc_edges(ext, "writes_field")
+
+
+def _flow():
+    return extract_salesforce_metadata(_one_file("flows/Stamp_Region.flow-meta.xml"))
+
+
+def _rel_targets(r, relation, source=None):
+    return {e["target"] for e in r["edges"]
+            if e["relation"] == relation and (source is None or e["source"] == source)}
+
+
+def test_flow_trigger_attrs():
+    r = _flow()
+    flow = next(n for n in r["nodes"] if n["id"] == make_id("flow", "Stamp_Region"))
+    assert flow["trigger_type"] == "RecordAfterSave"
+    assert flow["record_trigger_type"] == "CreateAndUpdate"
+    assert flow["process_type"] == "AutoLaunchedFlow"
+    edge = next(e for e in r["edges"] if e["relation"] == "triggers_on")
+    assert edge["target"] == make_id("Opportunity")
+    assert edge["trigger_type"] == "RecordAfterSave"
+    assert edge["record_trigger_type"] == "CreateAndUpdate"
+
+
+def test_flow_writes_explicit_object():
+    assert make_id("Account", "Region__c") in _rel_targets(_flow(), "writes_field")
+
+
+def test_flow_writes_via_variable():
+    assert make_id("npe01__OppPayment__c", "Revenue_Period__c") in _rel_targets(
+        _flow(), "writes_field")
+
+
+def test_flow_reads_lookup_filter():
+    r = _flow()
+    reads = _rel_targets(r, "reads_field")
+    assert make_id("npe01__OppPayment__c", "Status__c") in reads
+    assert make_id("npe01__OppPayment__c", "Name") in reads
+
+
+def test_flow_split_tag_parsed():
+    assert make_id("Opportunity", "StageName") in _rel_targets(_flow(), "reads_field")

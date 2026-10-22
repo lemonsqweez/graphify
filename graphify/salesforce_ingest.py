@@ -19,6 +19,7 @@ already covers it.
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,9 @@ def is_salesforce_metadata_path(path: Path) -> bool:
     which is otherwise unclassified, so generic XML stays untouched."""
     name = Path(path).name
     return any(name.endswith(suffix) for suffix in SF_METADATA_SUFFIXES)
+
+
+_RECORD_REF_RE = re.compile(r"^\$Record(?:__Prior)?\.(\w+)$")
 
 
 def _local(tag: str) -> str:
@@ -149,13 +153,60 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
     elif name.endswith(".flow-meta.xml"):
         flow_nid = make_id("flow", strip_suffix(".flow-meta.xml"))
         add_node(flow_nid, strip_suffix(".flow-meta.xml"))
+        flow_node = nodes[-1] if nodes and nodes[-1]["id"] == flow_nid else None
+        trigger_type = record_trigger_type = None
+        start_obj: str | None = None
         triggered: set[str] = set()
         for start in _find_all(root, "start"):
             obj = _child_text(start, "object")
+            trigger_type = _child_text(start, "triggerType")
+            record_trigger_type = _child_text(start, "recordTriggerType")
             if obj:
+                start_obj = obj
                 o_nid = obj_ref(obj)
-                add_edge(flow_nid, o_nid, "triggers_on")
+                add_edge(flow_nid, o_nid, "triggers_on",
+                         trigger_type=trigger_type, record_trigger_type=record_trigger_type)
                 triggered.add(o_nid)
+        if flow_node is not None:
+            flow_node["trigger_type"] = trigger_type
+            flow_node["record_trigger_type"] = record_trigger_type
+            flow_node["process_type"] = _child_text(root, "processType")
+
+        # Field-level access. A record element names its object directly
+        # (<object>), through a variable (<inputReference> -> the variable's
+        # <objectType>), or implicitly as the triggering record ($Record).
+        var_types = {
+            _child_text(v, "name"): _child_text(v, "objectType")
+            for v in _find_all(root, "variables") if _child_text(v, "objectType")
+        }
+        for kind in ("recordUpdates", "recordCreates", "recordLookups", "recordDeletes"):
+            for el in _find_all(root, kind):
+                obj = _child_text(el, "object")
+                if not obj:
+                    ref = _child_text(el, "inputReference")
+                    obj = var_types.get(ref) if ref and ref != "$Record" else start_obj
+                if not obj:
+                    continue
+                if kind in ("recordUpdates", "recordCreates"):
+                    for ia in _find_all(el, "inputAssignments"):
+                        field = _child_text(ia, "field")
+                        if field:
+                            add_edge(flow_nid, field_node(obj, field, stub=True), "writes_field")
+                for flt in _find_all(el, "filters"):
+                    field = _child_text(flt, "field")
+                    if field:
+                        add_edge(flow_nid, field_node(obj, field, stub=True), "reads_field")
+                for qf in _find_all(el, "queriedFields"):
+                    field = (qf.text or "").strip()
+                    if field:
+                        add_edge(flow_nid, field_node(obj, field, stub=True), "reads_field")
+        if start_obj:
+            for el in root.iter():
+                if _local(el.tag) in ("leftValueReference", "elementReference"):
+                    m = _RECORD_REF_RE.match((el.text or "").strip())
+                    if m:
+                        add_edge(flow_nid, field_node(start_obj, m.group(1), stub=True),
+                                 "reads_field")
         # Objects touched by record elements (lookups/creates/updates/deletes).
         for el in root.iter():
             if _local(el.tag) == "object":

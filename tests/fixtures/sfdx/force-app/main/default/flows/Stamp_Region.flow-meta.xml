@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>67.0</apiVersion>
+    <processType>AutoLaunchedFlow</processType>
+    <decisions>
+        <name>Is_Closed</name>
+        <label>Is Closed</label>
+        <defaultConnector>
+            <targetReference>Update_Account</targetReference>
+        </defaultConnector>
+        <rules>
+            <name>Closed</name>
+            <conditionLogic>and</conditionLogic>
+            <conditions>
+                <leftValueReference
+                    >$Record.StageName</leftValueReference>
+                <operator>EqualTo</operator>
+                <rightValue>
+                    <stringValue>Closed Won</stringValue>
+                </rightValue>
+            </conditions>
+            <label>Closed</label>
+        </rules>
+    </decisions>
+    <recordLookups>
+        <name>Get_Payments</name>
+        <label>Get Payments</label>
+        <object>npe01__OppPayment__c</object>
+        <filters>
+            <field>Status__c</field>
+            <operator>EqualTo</operator>
+            <value>
+                <stringValue>Open</stringValue>
+            </value>
+        </filters>
+        <queriedFields>Name</queriedFields>
+        <outputReference>varPayments</outputReference>
+    </recordLookups>
+    <recordUpdates>
+        <name>Update_Account</name>
+        <label>Update Account</label>
+        <object>Account</object>
+        <inputAssignments>
+            <field>Region__c</field>
+            <value>
+                <stringValue>West</stringValue>
+            </value>
+        </inputAssignments>
+    </recordUpdates>
+    <recordUpdates>
+        <name>Update_Payments</name>
+        <label>Update Payments</label>
+        <inputReference>varPayments</inputReference>
+        <inputAssignments>
+            <field>Revenue_Period__c</field>
+            <value>
+                <elementReference>$Record.Id</elementReference>
+            </value>
+        </inputAssignments>
+    </recordUpdates>
+    <start>
+        <object>Opportunity</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
+    </start>
+    <variables>
+        <name>varPayments</name>
+        <dataType>SObject</dataType>
+        <isCollection>true</isCollection>
+        <objectType>npe01__OppPayment__c</objectType>
+    </variables>
+</Flow>
