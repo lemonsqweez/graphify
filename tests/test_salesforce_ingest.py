@@ -248,3 +248,42 @@ def test_validation_rule_reads_field():
     r = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
     rule = make_id("Account", "vr", "Region_Required")
     assert _rel_targets(r, "reads_field", rule) == {make_id("Account", "Region__c")}
+
+
+_PWC_CLS = ("public class PaymentWorkspaceController {\n"
+            "  @AuraEnabled\n  public static void getWorkspace() {}\n}\n")
+_PWC_JS = ('import getWorkspace from "@salesforce/apex/PaymentWorkspaceController.getWorkspace";\n'
+           "export default class Pw {}\n")
+_PWC_TEST_JS = ('import saveVolume from "@salesforce/apex/PaymentWorkspaceController.saveVolume";\n'
+                "export const x = saveVolume;\n")
+
+
+def test_lwc_calls_apex_method(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/PaymentWorkspaceController.cls": _PWC_CLS,
+        "force-app/main/default/lwc/pw/pw.js": _PWC_JS,
+    })
+    by_id = {n["id"]: n for n in ext["nodes"]}
+    calls = _edges(ext, "calls_apex")
+    assert len(calls) == 1
+    assert by_id[calls[0]["target"]]["label"] == ".getWorkspace()"
+    assert by_id[calls[0]["source"]]["label"] == "pw.js"
+    assert calls[0]["confidence"] == "EXTRACTED"
+
+
+def test_lwc_tests_dir_ignored(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/PaymentWorkspaceController.cls": _PWC_CLS,
+        "force-app/main/default/lwc/pw/__tests__/pw.test.js": _PWC_TEST_JS,
+    })
+    assert not _edges(ext, "calls_apex")
+
+
+def test_lwc_unknown_method_falls_back_to_class(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/PaymentWorkspaceController.cls": _PWC_CLS,
+        "force-app/main/default/lwc/pw/pw.js": _PWC_TEST_JS,
+    })
+    by_id = {n["id"]: n for n in ext["nodes"]}
+    calls = _edges(ext, "calls_apex")
+    assert [by_id[e["target"]]["label"] for e in calls] == ["PaymentWorkspaceController"]

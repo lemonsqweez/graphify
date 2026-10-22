@@ -353,6 +353,59 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
     return {"nodes": nodes, "edges": edges}
 
 
+_LWC_APEX_IMPORT_RE = re.compile(r"@salesforce/apex/(\w+)\.(\w+)")
+
+
+def _link_lwc_to_apex(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """Add ``calls_apex`` edges from an LWC file to the Apex method it imports.
+
+    The JS extractor collapses every ``@salesforce/apex/Class.method`` import to
+    one shared ``ref_salesforce_apex`` node, so the class and method are recovered
+    by reading the importing ``.js`` (components only; ``__tests__`` mocks name
+    methods that need not exist). The target is the method node, else the class."""
+    classes: dict[str, list[dict]] = {}
+    for node in all_nodes:
+        if str(node.get("source_file") or "").endswith(".cls") and not str(node.get("label", "")).startswith("."):
+            classes.setdefault(str(node.get("label", "")).casefold(), []).append(node)
+    by_id = {str(n.get("id")): n for n in all_nodes}
+    methods: dict[str, dict[str, dict]] = {}
+    for edge in all_edges:
+        if edge.get("relation") == "method":
+            child = by_id.get(str(edge.get("target")))
+            label = str(child.get("label", "")) if child else ""
+            if label.startswith(".") and label.endswith("()"):
+                methods.setdefault(str(edge.get("source")), {})[label[1:-2].casefold()] = child
+
+    seen: set[tuple[str, str]] = set()
+    new_edges: list[dict] = []
+    for edge in all_edges:
+        if edge.get("relation") != "imports_from" or edge.get("target") != "ref_salesforce_apex":
+            continue
+        src_file = str(edge.get("source_file") or "")
+        if not src_file or "__tests__" in Path(src_file).parts:
+            continue
+        try:
+            text = Path(src_file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _LWC_APEX_IMPORT_RE.finditer(text):
+            cands = classes.get(m.group(1).casefold(), [])
+            if len(cands) != 1:
+                continue
+            cls = cands[0]
+            target = methods.get(str(cls["id"]), {}).get(m.group(2).casefold(), cls)
+            key = (str(edge["source"]), str(target["id"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            new_edges.append({
+                "source": edge["source"], "target": target["id"], "relation": "calls_apex",
+                "confidence": "EXTRACTED", "source_file": src_file,
+                "source_location": None, "weight": 1.0,
+            })
+    all_edges.extend(new_edges)
+
+
 def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
                                   all_edges: list[dict]) -> None:
     """Fold sourceless SObject/field stubs into their ``*-meta.xml`` definitions.
@@ -366,6 +419,7 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
     case-folded label against definitions in SFDX metadata files only, and only
     when that definition is unique.
     """
+    _link_lwc_to_apex(all_nodes, all_edges)
     real_by_label: dict[str, list[dict]] = {}
     for node in all_nodes:
         src = str(node.get("source_file") or "")
