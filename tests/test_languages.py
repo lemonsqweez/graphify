@@ -14,6 +14,8 @@ from graphify.extract import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+from graphify.ids import make_id as _make_id
+
 # tree-sitter-dm is an optional extra (#1104) - it ships no Linux/Mac wheel, so it
 # is not installed by a default `uv sync`. Skip the .dm/.dme grammar tests when the
 # grammar is absent (.dmi/.dmm/.dmf use no tree-sitter and are always tested).
@@ -4419,14 +4421,63 @@ def test_apex_contains_and_method_relations():
 def test_apex_soql_uses_edge():
     r = extract_apex(FIXTURES / "sample.cls")
     relations = _relations(r)
-    assert "uses" in relations
+    assert "queries" in relations
     labels = _labels(r)
     assert "Account" in labels
 
-def test_apex_dml_uses_edge():
+def test_apex_no_dml_nodes():
     r = extract_apex(FIXTURES / "sample.cls")
-    dml_labels = {n["label"] for n in r["nodes"] if n["label"] in ("insert", "update", "delete", "upsert")}
-    assert len(dml_labels) > 0
+    dml = {"insert", "update", "delete", "upsert", "merge", "undelete"}
+    assert not [n["label"] for n in r["nodes"] if n["label"] in dml]
+
+def test_apex_trigger_multiline_header(tmp_path):
+    src = tmp_path / "dlrs_AccountTrigger.trigger"
+    src.write_text(
+        "/** doc */\ntrigger dlrs_AccountTrigger on Account\n  (before delete, after insert)\n{\n}\n",
+        encoding="utf-8",
+    )
+    r = extract_apex(src)
+    trig = next(n for n in r["nodes"] if n["label"] == "dlrs_AccountTrigger")
+    assert trig["trigger_events"] == ["before delete", "after insert"]
+    assert any(
+        e["relation"] == "triggers_on" and e["source"] == trig["id"]
+        and e["target"] == _make_id("Account")
+        for e in r["edges"]
+    )
+
+def test_apex_soql_multiline_subquery(tmp_path):
+    src = tmp_path / "Q.cls"
+    src.write_text(
+        "public class Q {\n  public void run() {\n"
+        "    List<Account> a = [SELECT Id, (SELECT Id FROM Contacts) FROM Account\n"
+        "      WHERE Id IN (SELECT AccountId FROM Opportunity)];\n  }\n}\n",
+        encoding="utf-8",
+    )
+    r = extract_apex(src)
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "queries"}
+    assert targets == {_make_id("Account"), _make_id("Opportunity")}
+    assert "Contacts" not in _labels(r)
+
+def test_apex_dynamic_soql(tmp_path):
+    src = tmp_path / "D.cls"
+    src.write_text(
+        "public class D {\n  public void run() {\n"
+        "    Database.query('SELECT Id FROM Revenue_Period__c');\n  }\n}\n",
+        encoding="utf-8",
+    )
+    r = extract_apex(src)
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "queries"}
+    assert _make_id("Revenue_Period__c") in targets
+
+def test_apex_sobject_stub_sourceless():
+    for fixture in ("sample.cls", "sample.trigger"):
+        r = extract_apex(FIXTURES / fixture)
+        by_id = {n["id"]: n for n in r["nodes"]}
+        targets = [e["target"] for e in r["edges"] if e["relation"] in ("queries", "triggers_on")]
+        assert targets
+        for t in targets:
+            assert by_id[t]["source_file"] == ""
+            assert "origin_file" not in by_id[t]
 
 def test_apex_file_node_present():
     r = extract_apex(FIXTURES / "sample.cls")
@@ -4442,7 +4493,7 @@ def test_apex_trigger_extraction():
 def test_apex_trigger_uses_sobject():
     r = extract_apex(FIXTURES / "sample.trigger")
     relations = _relations(r)
-    assert "uses" in relations
+    assert "triggers_on" in relations
     labels = _labels(r)
     assert "Account" in labels
 

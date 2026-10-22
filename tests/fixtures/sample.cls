@@ -41,6 +41,12 @@ public with sharing class AccountService {
         delete old;
     }
 
+    public static List<Account> withSubquery() {
+        return [SELECT Id, (SELECT Id FROM Contacts)
+                FROM Account
+                WHERE Id IN (SELECT AccountId FROM Opportunity)];
+    }
+
     @isTest
     static void testGetAccounts() {
         List<Account> result = getAccounts('Customer');

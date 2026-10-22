@@ -23,15 +23,21 @@ def extract_apex(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    def add_node(nid: str, label: str, line: int, stub: bool = False) -> None:
+        # stub=True: a cross-file SObject/field reference (SOQL FROM, trigger
+        # header). It carries no source_file and, deliberately, no origin_file,
+        # so _disambiguate_colliding_node_ids leaves the bare id shared across
+        # every Apex file instead of salting it per file. The unique-stub rewire
+        # and resolve_salesforce_references then fold it into the object's or
+        # field's *-meta.xml definition.
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
                 "id": nid,
                 "label": label,
                 "file_type": "code",
-                "source_file": str_path,
-                "source_location": f"L{line}",
+                "source_file": "" if stub else str_path,
+                "source_location": None if stub else f"L{line}",
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -69,17 +75,26 @@ def extract_apex(path: Path) -> dict:
         rf"^{_ANNOTATION}\s*{_ACCESS}{_SHARING}{_MOD}\s*enum\s+(\w+)\s*\{{?",
         _re.IGNORECASE,
     )
+    # The header is matched over the whole source: real triggers open with a
+    # comment block and put the events on a following line.
     trigger_re = _re.compile(
-        r"^\s*trigger\s+(\w+)\s+on\s+(\w+)\s*\(",
-        _re.IGNORECASE,
+        r"^[ \t]*trigger\s+(\w+)\s+on\s+(\w+)\s*\(([^)]*)\)",
+        _re.IGNORECASE | _re.MULTILINE,
     )
+    trigger_header = trigger_re.search(source)
+    trigger_line = (source.count("\n", 0, trigger_header.start(1)) + 1
+                    if trigger_header else -1)
     method_re = _re.compile(
         rf"^{_ANNOTATION}\s*{_ACCESS}{_MOD}\s*(?:static\s+)?[\w<>\[\]]+\s+(\w+)\s*\([^)]*\)\s*(?:throws\s+\w+\s*)?\{{?",
         _re.IGNORECASE,
     )
     annotation_re = _re.compile(r"@(\w+)", _re.IGNORECASE)
-    soql_re = _re.compile(r"\[\s*SELECT\b[^\]]+FROM\s+(\w+)", _re.IGNORECASE)
-    dml_re = _re.compile(r"\b(insert|update|delete|upsert|merge|undelete)\s+\w", _re.IGNORECASE)
+    # SOQL spans lines in real code, so it is matched over the whole source after
+    # the line loop: static `[SELECT ...]` queries and dynamic string queries.
+    soql_static_re = _re.compile(r"\[\s*(SELECT\b[^\]]*)\]", _re.IGNORECASE)
+    soql_string_re = _re.compile(r"'\s*(SELECT\b[^']*)'", _re.IGNORECASE)
+    from_re = _re.compile(r"\bFROM\s+(\w+)", _re.IGNORECASE)
+    custom_field_re = _re.compile(r"(?<![\w.])(\w+__c)\b", _re.IGNORECASE)
 
     _CONTROL_FLOW = frozenset({
         "if", "else", "for", "while", "do", "switch", "try", "catch",
@@ -90,8 +105,12 @@ def extract_apex(path: Path) -> dict:
 
     current_class_nid: str | None = None
     pending_annotations: list[str] = []
+    # Owner (enclosing class/trigger, else the file) of each line, so SOQL
+    # matched over the whole source afterwards attributes to the right class.
+    line_owner: list[str] = [file_nid] * (len(lines) + 2)
 
     for lineno, line_text in enumerate(lines, start=1):
+        line_owner[lineno] = current_class_nid or file_nid
         stripped = line_text.strip()
 
         if stripped.startswith("@"):
@@ -99,16 +118,18 @@ def extract_apex(path: Path) -> dict:
                 pending_annotations.append(m.group(1).lower())
             continue
 
-        tm = trigger_re.match(stripped)
-        if tm:
-            trig_name, sobject = tm.group(1), tm.group(2)
+        if lineno == trigger_line and trigger_header:
+            trig_name, sobject = trigger_header.group(1), trigger_header.group(2)
             trig_nid = _make_id(stem, trig_name)
             add_node(trig_nid, trig_name, lineno)
+            nodes[-1]["trigger_events"] = [
+                " ".join(ev.split()).lower()
+                for ev in trigger_header.group(3).split(",") if ev.strip()
+            ]
             add_edge(file_nid, trig_nid, "contains", lineno)
             sob_nid = _make_id(sobject)
-            if sob_nid not in seen_ids:
-                add_node(sob_nid, sobject, lineno)
-            add_edge(trig_nid, sob_nid, "uses", lineno, confidence="INFERRED")
+            add_node(sob_nid, sobject, lineno, stub=True)
+            add_edge(trig_nid, sob_nid, "triggers_on", lineno)
             current_class_nid = trig_nid
             pending_annotations = []
             continue
@@ -196,20 +217,59 @@ def extract_apex(path: Path) -> dict:
 
         pending_annotations = []
 
-        for sm in soql_re.finditer(line_text):
-            sobject = sm.group(1)
-            sob_nid = _make_id(sobject)
-            if sob_nid not in seen_ids:
-                add_node(sob_nid, sobject, lineno)
-            src = current_class_nid or file_nid
-            add_edge(src, sob_nid, "uses", lineno, confidence="INFERRED")
+    # DML statements (insert/update/delete/...) deliberately emit no nodes: regex
+    # can't resolve the operand's SObject type, so a `dml_<op>` verb node becomes
+    # one global hub wired to every class doing DML. "This code touches
+    # <SObject>" is captured by SOQL FROM edges and trigger headers instead.
+    seen_soql_edges: set[tuple[str, str]] = set()
 
-        for dm in dml_re.finditer(line_text):
-            dml_op = dm.group(1).lower()
-            dml_nid = _make_id(f"dml_{dml_op}")
-            if dml_nid not in seen_ids:
-                add_node(dml_nid, dml_op, lineno)
-            src = current_class_nid or file_nid
-            add_edge(src, dml_nid, "uses", lineno, confidence="INFERRED")
+    def soql_edge(src: str, tgt: str, relation: str, line: int) -> None:
+        if (src, tgt) not in seen_soql_edges:
+            seen_soql_edges.add((src, tgt))
+            add_edge(src, tgt, relation, line, confidence="INFERRED")
+
+    for query_re in (soql_static_re, soql_string_re):
+        for qm in query_re.finditer(source):
+            query = qm.group(1)
+            lineno = source.count("\n", 0, qm.start()) + 1
+            src = line_owner[min(lineno, len(line_owner) - 1)]
+            # Paren depth at each FROM: depth 0 is the outer object. A nested FROM
+            # *before* it is a child-relationship subquery (`(SELECT Id FROM
+            # Contacts)`, a relationship name, not an SObject) and is skipped; one
+            # *after* it is a semi-join (`WHERE Id IN (SELECT AccountId FROM
+            # Contact)`) and names a real SObject.
+            depth_at = [0] * (len(query) + 1)
+            depth = 0
+            for i, ch in enumerate(query):
+                depth_at[i] = depth
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+            outer_obj: str | None = None
+            outer_pos = -1
+            for fm in from_re.finditer(query):
+                if depth_at[fm.start()] == 0:
+                    outer_obj, outer_pos = fm.group(1), fm.start()
+                    break
+            if outer_obj is None:
+                continue
+            for fm in from_re.finditer(query):
+                obj = fm.group(1)
+                if fm.start() != outer_pos and fm.start() < outer_pos:
+                    continue
+                sob_nid = _make_id(obj)
+                add_node(sob_nid, obj, lineno, stub=True)
+                soql_edge(src, sob_nid, "queries", lineno)
+            # Custom fields (`Foo__c`) read at the outer level bind to their
+            # .field-meta.xml definitions. Standard fields (Id, Name) are left
+            # out: they have no definition in the repo and would only add noise.
+            for cf in custom_field_re.finditer(query):
+                if depth_at[cf.start()] != 0:
+                    continue
+                field = cf.group(1)
+                f_nid = _make_id(outer_obj, field)
+                add_node(f_nid, f"{outer_obj}.{field}", lineno, stub=True)
+                soql_edge(src, f_nid, "reads_field", lineno)
 
     return {"nodes": nodes, "edges": edges}
