@@ -190,6 +190,7 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             if vr_name:
                 vr_nid = make_id(obj_api, "vr", vr_name)
                 add_node(vr_nid, f"{obj_api}.{vr_name}")
+                nodes[-1]["active"] = _child_text(vr, "active") == "true"
                 add_edge(obj_nid, vr_nid, "validates")
                 add_formula_refs(vr_nid, obj_api, _child_text(vr, "errorConditionFormula"))
 
@@ -220,6 +221,8 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             flow_node["trigger_type"] = trigger_type
             flow_node["record_trigger_type"] = record_trigger_type
             flow_node["process_type"] = _child_text(root, "processType")
+            flow_node["status"] = _child_text(root, "status")
+            flow_node["active"] = flow_node["status"] == "Active"
 
         # Field-level access. A record element names its object directly
         # (<object>), through a variable (<inputReference> -> the variable's
@@ -270,6 +273,7 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             rule_api = strip_suffix(".validationRule-meta.xml")
             rule_nid = make_id(obj_api, "vr", rule_api)
             add_node(rule_nid, f"{obj_api}.{rule_api}")
+            nodes[-1]["active"] = _child_text(root, "active") == "true"
             add_edge(obj_ref(obj_api), rule_nid, "validates")
             add_formula_refs(rule_nid, obj_api, _child_text(root, "errorConditionFormula"))
 

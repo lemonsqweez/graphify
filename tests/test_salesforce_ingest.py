@@ -319,6 +319,15 @@ def test_tests_edge_static_field_access_resolves(tmp_path):
     assert [e["target"] for e in _edges(ext, "tests")] == [handler[0]["id"]]
 
 
+def test_validation_rule_and_flow_active_attrs():
+    rule = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
+    assert next(n for n in rule["nodes"] if n["id"] == make_id("Account", "vr", "Region_Required"))["active"] is True
+    legacy = _meta("objects/Account/validationRules/Legacy_Rule.validationRule-meta.xml")
+    assert next(n for n in legacy["nodes"] if n["id"] == make_id("Account", "vr", "Legacy_Rule"))["active"] is False
+    flow = next(n for n in _flow()["nodes"] if n["id"] == make_id("flow", "Stamp_Region"))
+    assert flow["status"] == "Active" and flow["active"] is True
+
+
 def test_affected_includes_sf_relations():
     from graphify.affected import DEFAULT_AFFECTED_RELATIONS
     for rel in ("queries", "writes_field", "reads_field", "triggers_on", "has_field",

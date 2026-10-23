@@ -2,6 +2,7 @@
 <Flow xmlns="http://soap.sforce.com/2006/04/metadata">
     <apiVersion>67.0</apiVersion>
     <processType>AutoLaunchedFlow</processType>
+    <status>Active</status>
     <decisions>
         <name>Is_Closed</name>
         <label>Is Closed</label>
