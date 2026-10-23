@@ -4511,6 +4511,18 @@ def test_apex_no_dangling_edges():
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
 
 
+def test_apex_tests_edge_static_member_access(tmp_path):
+    src = tmp_path / "FlagTest.cls"
+    src.write_text(
+        "@isTest\nprivate class FlagTest {\n  @isTest\n  static void t() {\n"
+        "    Handler.migrationMode = true;\n    Integer n = Limits.getQueries();\n  }\n}\n",
+        encoding="utf-8",
+    )
+    r = extract_apex(src)
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "tests"}
+    assert _make_id("Handler") in targets
+
+
 def test_apex_is_test_flag(tmp_path):
     src = tmp_path / "T.cls"
     src.write_text("@isTest\nprivate class HandlerTest {\n}\npublic class Handler {\n}\n",

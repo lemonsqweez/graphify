@@ -308,6 +308,17 @@ def test_tests_edge_resolves_to_class(tmp_path):
     assert not _by_label(ext, "System")
 
 
+def test_tests_edge_static_field_access_resolves(tmp_path):
+    flag_test = ("@isTest\nprivate class FlagTest {\n  @isTest\n  static void t() {\n"
+                 "    Handler.migrationMode = true;\n  }\n}\n")
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/Handler.cls": _HANDLER_CLS,
+        "force-app/main/default/classes/FlagTest.cls": flag_test,
+    })
+    handler = [n for n in _by_label(ext, "Handler") if n["source_file"].endswith("Handler.cls")]
+    assert [e["target"] for e in _edges(ext, "tests")] == [handler[0]["id"]]
+
+
 def test_affected_includes_sf_relations():
     from graphify.affected import DEFAULT_AFFECTED_RELATIONS
     for rel in ("queries", "writes_field", "reads_field", "triggers_on", "has_field",

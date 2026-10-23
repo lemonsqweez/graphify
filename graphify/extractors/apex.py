@@ -115,7 +115,8 @@ def extract_apex(path: Path) -> dict:
     test_class_nid: str | None = None
     test_class_name: str | None = None
     seen_tests: set[tuple[str, str]] = set()
-    tested_re = _re.compile(r"\bnew\s+([A-Z]\w*)\s*\(|\b([A-Z]\w*)\s*\.\s*\w+\s*\(")
+    # `new X(` or any static member access `X.member` (call, constant or field).
+    tested_re = _re.compile(r"\bnew\s+([A-Z]\w*)\s*\(|\b([A-Z]\w*)\s*\.\s*\w+")
 
     for lineno, line_text in enumerate(lines, start=1):
         line_owner[lineno] = current_class_nid or file_nid
