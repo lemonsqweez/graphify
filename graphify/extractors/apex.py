@@ -6,6 +6,44 @@ from pathlib import Path
 from graphify.extractors.base import _file_stem, _make_id, _read_source_text
 
 
+def _blank_source(text: str, strings: bool) -> str:
+    """Same-length copy of ``text`` with comments (and, when ``strings`` is set,
+    string-literal text) replaced by spaces. Newlines are kept, so offsets and
+    line numbers still line up with the original source."""
+    out = list(text)
+    n = len(text)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif text[i] == "'":
+            j = i + 1
+            while j < n and text[j] not in "'\n":
+                j += 2 if text[j] == "\\" else 1
+            end = min(j + 1, n)
+            if strings:
+                blank(i, end)
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
+
 def extract_apex(path: Path) -> dict:
     """Extract classes, interfaces, enums, methods, and Salesforce constructs from
     Apex .cls and .trigger files using regex (no tree-sitter grammar on PyPI)."""
@@ -325,8 +363,13 @@ def extract_apex(path: Path) -> dict:
             seen_soql_edges.add((src, tgt))
             add_edge(src, tgt, relation, line, confidence="INFERRED")
 
+    # Commented-out code must not produce edges. SOQL scans keep string literals
+    # (dynamic queries live in them); the field scans below also blank strings.
+    uncommented = _blank_source(source, strings=False)
+    code_only = _blank_source(source, strings=True)
+
     for query_re in (soql_static_re, soql_string_re):
-        for qm in query_re.finditer(source):
+        for qm in query_re.finditer(uncommented):
             query = qm.group(1)
             lineno = source.count("\n", 0, qm.start()) + 1
             src = line_owner[min(lineno, len(line_owner) - 1)]
@@ -364,6 +407,9 @@ def extract_apex(path: Path) -> dict:
             for cf in custom_field_re.finditer(query):
                 if depth_at[cf.start()] != 0:
                     continue
+                # `FROM Revenue_Period__c`: the object name is not a field read.
+                if _re.search(r"\bFROM\s+$", query[:cf.start()], _re.IGNORECASE):
+                    continue
                 field = cf.group(1)
                 f_nid = _make_id(outer_obj, field)
                 add_node(f_nid, f"{outer_obj}.{field}", lineno, stub=True)
@@ -382,7 +428,7 @@ def extract_apex(path: Path) -> dict:
     )
     decls: list[tuple[int, str, str]] = []  # (offset, var, type)
     for dre in decl_res:
-        for dm in dre.finditer(source):
+        for dm in dre.finditer(code_only):
             decls.append((dm.start(), dm.group(2), dm.group(1)))
 
     def declared_type(var: str, offset: int) -> str | None:
@@ -393,7 +439,7 @@ def extract_apex(path: Path) -> dict:
         return best[1] if best else None
 
     soql_spans = [m.span() for rx in (soql_static_re, soql_string_re)
-                  for m in rx.finditer(source)]
+                  for m in rx.finditer(uncommented)]
 
     def in_soql(pos: int) -> bool:
         return any(a <= pos < b for a, b in soql_spans)
@@ -417,17 +463,17 @@ def extract_apex(path: Path) -> dict:
 
     ctor_re = _re.compile(r"\bnew\s+(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
     ctor_field_re = _re.compile(r"(?<![\w.])(\w+__c)\s*=(?!=)", _re.IGNORECASE)
-    for cm_ in ctor_re.finditer(source):
+    for cm_ in ctor_re.finditer(code_only):
         for fm in ctor_field_re.finditer(cm_.group(2)):
             src, ln = src_at(cm_.start())
             field_edge(src, cm_.group(1), fm.group(1), "writes_field", ln)
 
     access_re = _re.compile(r"(?<![\w.])(\w+)(?:\[[^\]]*\])?\.(\w+__c)\b", _re.IGNORECASE)
-    for am in access_re.finditer(source):
+    for am in access_re.finditer(code_only):
         var, field = am.group(1), am.group(2)
         if in_soql(am.start()) or var.lower().endswith("__r"):
             continue
-        is_write = _re.match(r"\s*=(?!=)", source[am.end():]) is not None
+        is_write = _re.match(r"\s*=(?!=)", code_only[am.end():]) is not None
         src, ln = src_at(am.start())
         field_edge(src, declared_type(var, am.start()), field,
                    "writes_field" if is_write else "reads_field", ln)

@@ -4511,6 +4511,41 @@ def test_apex_no_dangling_edges():
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
 
 
+def _apex_labels_and_edges(tmp_path, body):
+    src = tmp_path / "C.cls"
+    src.write_text("public class C {\n  public void run() {\n" + body + "\n  }\n}\n", encoding="utf-8")
+    r = extract_apex(src)
+    by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    edges = [(e["relation"], by_id[e["source"]], by_id[e["target"]]) for e in r["edges"]]
+    return set(by_id.values()), edges
+
+
+def test_apex_soql_from_custom_object_has_no_self_named_field(tmp_path):
+    labels, edges = _apex_labels_and_edges(
+        tmp_path, "    List<SObject> a = [SELECT Id, Region__c FROM Revenue_Period__c];")
+    assert "Revenue_Period__c.Revenue_Period__c" not in labels
+    assert ("reads_field", "C", "Revenue_Period__c.Region__c") in edges
+
+
+def test_apex_commented_out_code_makes_no_field_edges(tmp_path):
+    body = (
+        "    // opp.Revenue_Period__c = 1;\n"
+        "    /* Account a = new Account();\n       a.Region__c = 'x'; */\n"
+        "    // List<Account> xs = [SELECT Id, Hidden__c FROM Account];\n"
+        "    // Foo f = new Foo(Gone__c = 1);\n"
+    )
+    labels, edges = _apex_labels_and_edges(tmp_path, body)
+    assert not [e for e in edges if e[0] in ("writes_field", "reads_field", "queries")]
+    assert not [lab for lab in labels if "Gone__c" in lab or "Hidden__c" in lab]
+
+
+def test_apex_field_text_inside_string_literal_makes_no_edge(tmp_path):
+    labels, edges = _apex_labels_and_edges(
+        tmp_path, "    String s = 'p.Revenue_Period__c = 1';\n    String t = 'a /* b';\n    q.Real__c = 2;")
+    assert ("writes_field", ".run()", "*.Real__c") in edges
+    assert not [e for e in edges if "Revenue_Period__c" in e[2]]
+
+
 _OUTER_WITH_INNER = (
     "public class Outer {\n"
     "  public class Req {\n"
