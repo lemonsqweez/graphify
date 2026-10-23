@@ -7,11 +7,14 @@ stubs ``extract_apex`` mints from SOQL and trigger headers, wiring Apex code to
 the schema it touches.
 
 Handles: object (incl. legacy inline fields/rules); field (Lookup / MasterDetail
-relationships); flow (record-trigger object + referenced objects);
-validationRule; permissionset (field- and object-level grants). Relation
-vocabulary: ``has_field``, ``looks_up_to``, ``master_detail_to``,
-``triggers_on``, ``references``, ``validates``, ``grants_fls``,
-``grants_access``.
+relationships, formulas, roll-up summaries); flow (record-trigger object,
+referenced objects, field reads/writes, invocable Apex actions);
+validationRule; recordType; permissionset (field, object, record type and Apex
+class grants); DLRS rollups. Relation vocabulary: ``has_field``,
+``looks_up_to``, ``master_detail_to``, ``triggers_on``, ``references``,
+``validates``, ``reads_field``, ``writes_field``, ``has_record_type``,
+``calls_apex``, ``grants_fls``, ``grants_access``, ``grants_record_type``,
+``grants_apex``.
 
 Code-sidecar metadata (``.cls-meta.xml``, ``.trigger-meta.xml``,
 ``.js-meta.xml``) is intentionally not matched — the companion source file
@@ -81,6 +84,9 @@ def _formula_refs(formula: str) -> list[tuple[str | None, str]]:
 
 
 _RECORD_REF_RE = re.compile(r"^\$Record(?:__Prior)?\.(\w+)$")
+# `$Record.Field` or a one-hop `$Record.Rel__r.Field__c`; longer paths match
+# with group(3) set and are skipped, as are standard relationship hops.
+_RECORD_PATH_RE = re.compile(r"\$Record(?:__Prior)?\.(\w+)(?:\.(\w+))?(\.\w+)*")
 
 
 def _local(tag: str) -> str:
@@ -163,6 +169,11 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             return
         f_nid = field_node(obj_api, field_api, stub=False)
         add_formula_refs(f_nid, obj_api, _child_text(field_el, "formula"))
+        # Roll-up summary: "Child.Field" aggregated over the "Child.Lookup" master-detail.
+        for tag, relation in (("summarizedField", "reads_field"), ("summaryForeignKey", "references")):
+            ref = _child_text(field_el, tag)
+            if ref and "." in ref:
+                add_edge(f_nid, field_node(*ref.split(".", 1), stub=True), relation)
         ftype = _child_text(field_el, "type") or ""
         if ftype in ("Lookup", "MasterDetail", "Hierarchy"):
             relation = "master_detail_to" if ftype == "MasterDetail" else "looks_up_to"
@@ -252,13 +263,51 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
                     field = (qf.text or "").strip()
                     if field:
                         add_edge(flow_nid, field_node(obj, field, stub=True), "reads_field")
+        for dcs in _find_all(root, "dynamicChoiceSets"):
+            obj = _child_text(dcs, "object") or _child_text(dcs, "picklistObject")
+            if not obj:
+                continue
+            fields = [_child_text(dcs, t) for t in
+                      ("displayField", "valueField", "picklistField", "sortField")]
+            fields += [_child_text(c, "field") for c in dcs
+                       if _local(c.tag) in ("filters", "outputAssignments")]
+            for field in fields:
+                if field:
+                    add_edge(flow_nid, field_node(obj, field, stub=True), "reads_field")
         if start_obj:
+            for flt in (f for start in _find_all(root, "start") for f in _find_all(start, "filters")):
+                field = _child_text(flt, "field")
+                if field:
+                    add_edge(flow_nid, field_node(start_obj, field, stub=True), "reads_field")
+            # $Record references anywhere: element references, formulas, start
+            # filter formulas, text templates. Assigning to $Record.X is a write
+            # (the before-save field update idiom), not a read.
             for el in root.iter():
-                if _local(el.tag) in ("leftValueReference", "elementReference"):
-                    m = _RECORD_REF_RE.match((el.text or "").strip())
+                text = (el.text or "").strip()
+                if _local(el.tag) == "assignToReference":
+                    m = _RECORD_REF_RE.match(text)
                     if m:
                         add_edge(flow_nid, field_node(start_obj, m.group(1), stub=True),
-                                 "reads_field")
+                                 "writes_field")
+                    continue
+                for m in _RECORD_PATH_RE.finditer(text):
+                    head, tail = m.group(1), m.group(2)
+                    if m.group(3):
+                        continue
+                    if tail is None:
+                        add_edge(flow_nid, field_node(start_obj, head, stub=True), "reads_field")
+                    elif head.lower().endswith("__r") and tail.lower().endswith("__c"):
+                        nid = make_id(start_obj, head, tail)
+                        add_node(nid, f"{start_obj}.{head}.{tail}", stub=True)
+                        add_edge(flow_nid, nid, "reads_field")
+        # Invocable Apex actions. The class stub folds into the class via the
+        # generic rewire; _prune_unresolved_apex_edges drops it if no class exists.
+        for ac in _find_all(root, "actionCalls"):
+            cls_api = _child_text(ac, "actionName")
+            if cls_api and _child_text(ac, "actionType") == "apex":
+                cls_nid = make_id(cls_api)
+                add_node(cls_nid, cls_api, stub=True)
+                add_edge(flow_nid, cls_nid, "calls_apex")
         # Objects touched by record elements (lookups/creates/updates/deletes).
         for el in root.iter():
             if _local(el.tag) == "object":
@@ -357,13 +406,18 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
     return {"nodes": nodes, "edges": edges}
 
 
-def _prune_test_edges(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    """Keep a ``tests`` edge only when it lands on an Apex class or trigger.
+_APEX_TARGET_RELATIONS = frozenset({"tests", "calls_apex"})
 
-    ``extract_apex`` emits one per capitalized type a test class touches; after
-    the generic stub rewire those naming real Apex classes point at the class node,
-    while ``System``/``Test`` and SObjects (``new Account(...)``) are not code under
-    test, so their edges are dropped, and then any stub left with no edge."""
+
+def _prune_unresolved_apex_edges(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """Keep a ``tests`` / ``calls_apex`` edge only when it lands on Apex code.
+
+    ``extract_apex`` emits a ``tests`` edge per capitalized type a test class
+    touches, and a flow emits ``calls_apex`` per invocable action. After the
+    generic stub rewire those naming real Apex classes point at the class node,
+    while ``System``/``Test``, SObjects (``new Account(...)``) and actions whose
+    class is not in the project are not, so their edges are dropped, and then
+    any stub left with no edge."""
     by_id = {str(n.get("id")): n for n in all_nodes}
 
     def is_apex(node: dict | None) -> bool:
@@ -372,7 +426,7 @@ def _prune_test_edges(all_nodes: list[dict], all_edges: list[dict]) -> None:
     dropped_targets: set[str] = set()
     kept: list[dict] = []
     for edge in all_edges:
-        if edge.get("relation") == "tests" and not is_apex(by_id.get(str(edge.get("target")))):
+        if edge.get("relation") in _APEX_TARGET_RELATIONS and not is_apex(by_id.get(str(edge.get("target")))):
             dropped_targets.add(str(edge.get("target")))
             continue
         kept.append(edge)
@@ -452,7 +506,7 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
     when that definition is unique.
     """
     _link_lwc_to_apex(all_nodes, all_edges)
-    _prune_test_edges(all_nodes, all_edges)
+    _prune_unresolved_apex_edges(all_nodes, all_edges)
     real_by_label: dict[str, list[dict]] = {}
     for node in all_nodes:
         src = str(node.get("source_file") or "")

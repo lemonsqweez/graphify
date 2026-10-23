@@ -166,6 +166,62 @@ def test_flow_split_tag_parsed():
     assert make_id("Opportunity", "StageName") in _rel_targets(_flow(), "reads_field")
 
 
+def test_flow_record_assignment_writes_field():
+    r = _flow()
+    code = make_id("Opportunity", "Region_Code__c")
+    assert code in _rel_targets(r, "writes_field")
+    assert code not in _rel_targets(r, "reads_field")
+
+
+def test_flow_record_refs_in_start_and_formulas_read_fields():
+    reads = _rel_targets(_flow(), "reads_field")
+    for field in ("Type", "CloseDate", "Amount", "Description"):
+        assert make_id("Opportunity", field) in reads, field
+    assert make_id("Opportunity", "Account") not in reads
+
+
+def test_flow_record_relationship_hop_stub(tmp_path):
+    p = tmp_path / "Hop.flow-meta.xml"
+    p.write_text(
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata"><formulas><name>f</name>'
+        "<expression>{!$Record.Parent__r.Region__c} &amp; {!$Record.Parent__r.Owner.Name}"
+        "</expression></formulas><start><object>Account</object></start></Flow>",
+        encoding="utf-8")
+    r = extract_salesforce_metadata(p)
+    assert _labels_of_targets(r, "reads_field", make_id("flow", "Hop")) == {
+        "Account.Parent__r.Region__c"}
+
+
+def test_flow_dynamic_choice_set_reads_fields():
+    reads = _rel_targets(_flow(), "reads_field")
+    for field in ("Name", "Id", "Region__c"):
+        assert make_id("Account", field) in reads, field
+
+
+def test_flow_apex_action_calls_apex():
+    assert _rel_targets(_flow(), "calls_apex") == {make_id("PaymentEnrichmentHandler")}
+
+
+_ENRICH_CLS = ("public class PaymentEnrichmentHandler {\n"
+               "  @InvocableMethod\n  public static void enrich(List<Id> ids) {}\n}\n")
+
+
+def test_flow_calls_apex_folds_to_class(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/PaymentEnrichmentHandler.cls": _ENRICH_CLS})
+    classes = _by_label(ext, "PaymentEnrichmentHandler")
+    assert len(classes) == 1 and classes[0]["source_file"].endswith(".cls")
+    flow = _real(ext, "Stamp_Region", ".flow-meta.xml")
+    calls = _edges(ext, "calls_apex")
+    assert [(e["source"], e["target"]) for e in calls] == [(flow["id"], classes[0]["id"])]
+
+
+def test_flow_calls_apex_missing_class_dropped(tmp_path):
+    ext, _ = build_sfdx(tmp_path)
+    assert not _edges(ext, "calls_apex")
+    assert not _by_label(ext, "PaymentEnrichmentHandler")
+
+
 def _meta(rel):
     return extract_salesforce_metadata(_one_file(rel))
 
@@ -244,6 +300,13 @@ def test_formula_ignores_globals_strings_comments():
         assert not [lab for lab in labels if bad in lab.split(".")], (bad, labels)
 
 
+def test_rollup_summary_field_reads_child_field():
+    r = _meta("objects/Account/fields/Total_Payments__c.field-meta.xml")
+    total = make_id("Account", "Total_Payments__c")
+    assert _rel_targets(r, "reads_field", total) == {make_id("npe01__OppPayment__c", "Amount__c")}
+    assert _rel_targets(r, "references", total) == {make_id("npe01__OppPayment__c", "Account__c")}
+
+
 def test_validation_rule_reads_field():
     r = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
     rule = make_id("Account", "vr", "Region_Required")
@@ -317,6 +380,12 @@ def test_tests_edge_static_field_access_resolves(tmp_path):
     })
     handler = [n for n in _by_label(ext, "Handler") if n["source_file"].endswith("Handler.cls")]
     assert [e["target"] for e in _edges(ext, "tests")] == [handler[0]["id"]]
+
+
+def _real(ext, label, suffix):
+    nodes = [n for n in _by_label(ext, label) if str(n.get("source_file") or "").endswith(suffix)]
+    assert len(nodes) == 1, (label, _by_label(ext, label))
+    return nodes[0]
 
 
 def test_validation_rule_and_flow_active_attrs():

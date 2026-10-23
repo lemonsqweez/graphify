@@ -3,6 +3,55 @@
     <apiVersion>67.0</apiVersion>
     <processType>AutoLaunchedFlow</processType>
     <status>Active</status>
+    <actionCalls>
+        <name>Enrich_Payment</name>
+        <label>Enrich Payment</label>
+        <actionName>PaymentEnrichmentHandler</actionName>
+        <actionType>apex</actionType>
+        <inputParameters>
+            <name>recordId</name>
+            <value>
+                <elementReference>$Record.Id</elementReference>
+            </value>
+        </inputParameters>
+    </actionCalls>
+    <actionCalls>
+        <name>Notify_Owner</name>
+        <label>Notify Owner</label>
+        <actionName>emailSimple</actionName>
+        <actionType>emailSimple</actionType>
+    </actionCalls>
+    <assignments>
+        <name>Set_Code</name>
+        <label>Set Code</label>
+        <assignmentItems>
+            <assignToReference>$Record.Region_Code__c</assignToReference>
+            <operator>Assign</operator>
+            <value>
+                <elementReference>fxCode</elementReference>
+            </value>
+        </assignmentItems>
+    </assignments>
+    <dynamicChoiceSets>
+        <name>AccountChoices</name>
+        <dataType>String</dataType>
+        <displayField>Name</displayField>
+        <filterLogic>and</filterLogic>
+        <filters>
+            <field>Region__c</field>
+            <operator>EqualTo</operator>
+            <value>
+                <stringValue>West</stringValue>
+            </value>
+        </filters>
+        <object>Account</object>
+        <valueField>Id</valueField>
+    </dynamicChoiceSets>
+    <formulas>
+        <name>fxCode</name>
+        <dataType>String</dataType>
+        <expression>LEFT({!$Record.Description}, 3) &amp; {!$Record.Account.Name}</expression>
+    </formulas>
     <decisions>
         <name>Is_Closed</name>
         <label>Is Closed</label>
@@ -60,6 +109,14 @@
         </inputAssignments>
     </recordUpdates>
     <start>
+        <filterFormula>ISCHANGED({!$Record.CloseDate}) &amp;&amp; NOT(ISBLANK({!$Record__Prior.Amount}))</filterFormula>
+        <filters>
+            <field>Type</field>
+            <operator>EqualTo</operator>
+            <value>
+                <stringValue>Grant</stringValue>
+            </value>
+        </filters>
         <object>Opportunity</object>
         <recordTriggerType>CreateAndUpdate</recordTriggerType>
         <triggerType>RecordAfterSave</triggerType>
