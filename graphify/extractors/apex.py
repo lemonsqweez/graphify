@@ -115,10 +115,62 @@ def extract_apex(path: Path) -> dict:
     test_class_nid: str | None = None
     test_class_name: str | None = None
     seen_tests: set[tuple[str, str]] = set()
+
+    # Brace depth at the start of each line (strings and comments stripped), so a
+    # class or method scope ends where its braces close. Without it, the first
+    # inner class (`RepointRequest`, an exception type, ...) would capture every
+    # later member of its outer class.
+    depth_before = [0] * (len(lines) + 2)
+    depth = 0
+    in_block_comment = False
+    for i, raw in enumerate(lines, start=1):
+        depth_before[i] = depth
+        code, pos = [], 0
+        while pos < len(raw):
+            if in_block_comment:
+                end = raw.find("*/", pos)
+                if end < 0:
+                    pos = len(raw)
+                else:
+                    in_block_comment, pos = False, end + 2
+            elif raw.startswith("/*", pos):
+                in_block_comment, pos = True, pos + 2
+            elif raw.startswith("//", pos):
+                break
+            elif raw[pos] == "'":
+                pos += 1
+                while pos < len(raw) and raw[pos] != "'":
+                    pos += 2 if raw[pos] == "\\" else 1
+                pos += 1
+            else:
+                code.append(raw[pos])
+                pos += 1
+        text = "".join(code)
+        depth += text.count("{") - text.count("}")
+    depth_before[len(lines) + 1] = depth
+    # [class nid, depth at its declaration line, body entered, enclosing test state]
+    class_stack: list[list] = []
+    method_scope: list | None = None  # [depth at declaration, body entered]
     # `new X(` or any static member access `X.member` (call, constant or field).
     tested_re = _re.compile(r"\bnew\s+([A-Z]\w*)\s*\(|\b([A-Z]\w*)\s*\.\s*\w+")
 
     for lineno, line_text in enumerate(lines, start=1):
+        d = depth_before[lineno]
+        if method_scope is not None:
+            if d > method_scope[0]:
+                method_scope[1] = True
+            elif method_scope[1]:
+                current_method_nid, method_scope = None, None
+        while class_stack:
+            top = class_stack[-1]
+            if d > top[1]:
+                top[2] = True
+            if not (top[2] and d <= top[1]):
+                break
+            class_stack.pop()
+            test_class_nid, test_class_name = top[3]
+            current_method_nid, method_scope = None, None
+            current_class_nid = class_stack[-1][0] if class_stack else None
         line_owner[lineno] = current_class_nid or file_nid
         line_src[lineno] = current_method_nid or current_class_nid or file_nid
         stripped = line_text.strip()
@@ -154,8 +206,9 @@ def extract_apex(path: Path) -> dict:
             sob_nid = _make_id(sobject)
             add_node(sob_nid, sobject, lineno, stub=True)
             add_edge(trig_nid, sob_nid, "triggers_on", lineno)
+            class_stack.append([trig_nid, depth_before[lineno], False, (test_class_nid, test_class_name)])
             current_class_nid = trig_nid
-            current_method_nid = None
+            current_method_nid, method_scope = None, None
             pending_annotations = []
             continue
 
@@ -167,6 +220,7 @@ def extract_apex(path: Path) -> dict:
                 continue
             class_nid = _make_id(stem, class_name)
             add_node(class_nid, class_name, lineno)
+            prev_test = (test_class_nid, test_class_name)
             if "istest" in pending_annotations:
                 nodes[-1]["is_test"] = True
                 test_class_nid, test_class_name = class_nid, class_name
@@ -191,8 +245,9 @@ def extract_apex(path: Path) -> dict:
                         if iface_nid not in seen_ids:
                             add_node(iface_nid, iface, lineno)
                         add_edge(class_nid, iface_nid, "implements", lineno, confidence="INFERRED")
+            class_stack.append([class_nid, depth_before[lineno], False, prev_test])
             current_class_nid = class_nid
-            current_method_nid = None
+            current_method_nid, method_scope = None, None
             pending_annotations = []
             continue
 
@@ -243,8 +298,15 @@ def extract_apex(path: Path) -> dict:
                     method_label = f".{method_name}()"
                     add_node(method_nid, method_label, lineno)
                     add_edge(current_class_nid, method_nid, "method", lineno)
-                    current_method_nid = method_nid
                     line_src[lineno] = method_nid
+                    # A bodiless declaration (`void m();`) or a one-line body
+                    # (`void m() { ... }`) never opens a multi-line scope.
+                    one_liner = "{" in stripped and depth_before[lineno + 1] <= depth_before[lineno]
+                    if stripped.endswith(";") or one_liner:
+                        current_method_nid, method_scope = None, None
+                    else:
+                        current_method_nid = method_nid
+                        method_scope = [depth_before[lineno], False]
                     if "auraenabled" in pending_annotations or "invocablemethod" in pending_annotations:
                         add_edge(file_nid, method_nid, "contains", lineno, confidence="INFERRED")
                     pending_annotations = []

@@ -4511,6 +4511,37 @@ def test_apex_no_dangling_edges():
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
 
 
+_OUTER_WITH_INNER = (
+    "public class Outer {\n"
+    "  public class Req {\n"
+    "    public String x;\n"
+    "    public void build() {\n      q.Status__c = 'b';\n    }\n"
+    "  }\n"
+    "  public void run(npe01__OppPayment__c p) {\n"
+    "    p.Region__c = 'a';\n"
+    "    List<Account> a = [SELECT Id FROM Account];\n"
+    "  }\n"
+    "}\n"
+    "public class Sibling {\n  public void other() {}\n}\n"
+)
+
+
+def test_apex_inner_class_does_not_capture_outer_members(tmp_path):
+    src = tmp_path / "Outer.cls"
+    src.write_text(_OUTER_WITH_INNER, encoding="utf-8")
+    r = extract_apex(src)
+    by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    parent_of = {e["target"]: by_id[e["source"]] for e in r["edges"] if e["relation"] == "method"}
+    owners = {by_id[t]: p for t, p in parent_of.items()}
+    assert owners[".run()"] == "Outer"
+    assert owners[".build()"] == "Req"
+    assert owners[".other()"] == "Sibling"
+    writes = [(by_id[e["source"]], by_id[e["target"]]) for e in r["edges"] if e["relation"] == "writes_field"]
+    assert (".run()", "npe01__OppPayment__c.Region__c") in writes
+    queries = [by_id[e["source"]] for e in r["edges"] if e["relation"] == "queries"]
+    assert queries == ["Outer"]
+
+
 def test_apex_tests_edge_static_member_access(tmp_path):
     src = tmp_path / "FlagTest.cls"
     src.write_text(
