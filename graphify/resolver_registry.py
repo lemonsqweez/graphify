@@ -24,6 +24,18 @@ from typing import Callable
 
 _LOG = logging.getLogger(__name__)
 
+# Relations of the UNCHANGED corpus that an incremental rebuild hands the
+# resolvers as read-only context (see extract(resolution_context_edges=...)):
+# the structure the member-call resolvers walk to map a receiver type to its
+# owning class and method. watch.py and cli.py both build their context from
+# this one list.
+CONTEXT_EDGE_RELATIONS: tuple[str, ...] = (
+    "contains", "method", "inherits", "imports", "imports_from",
+    # Salesforce: a formula's one-hop `Rel__r.Field__c` reference is resolved by
+    # following the unchanged `Rel__c` lookup field to its target object.
+    "looks_up_to", "master_detail_to",
+)
+
 
 @dataclass(frozen=True)
 class LanguageResolver:

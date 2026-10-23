@@ -333,3 +333,70 @@ def test_affected_includes_sf_relations():
     for rel in ("queries", "writes_field", "reads_field", "triggers_on", "has_field",
                 "looks_up_to", "master_detail_to", "calls_apex", "tests"):
         assert rel in DEFAULT_AFFECTED_RELATIONS, rel
+
+
+def _incremental(tmp_path, files, changed):
+    """Full extract, then re-extract only ``changed`` (relative paths) the way
+    graphify's incremental rebuild does: unchanged files reach the resolvers only
+    as read-only context nodes/edges."""
+    from graphify.resolver_registry import CONTEXT_EDGE_RELATIONS
+    root = tmp_path / "proj"
+    shutil.copytree(SFDX_FIXTURE, root)
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    full = extract(sorted(p for p in root.rglob("*") if p.is_file()), root=root, parallel=False)
+    changed_set = {Path(c).as_posix() for c in changed}
+
+    def unchanged(sf):
+        return Path(str(sf)).as_posix() not in changed_set
+
+    ctx_nodes = [{k: n.get(k) for k in ("id", "label", "source_file", "file_type", "type")}
+                 for n in full["nodes"] if n.get("source_file") and unchanged(n["source_file"])]
+    ctx_edges = [{k: e.get(k) for k in ("source", "target", "relation", "source_file")}
+                 for e in full["edges"]
+                 if e["relation"] in CONTEXT_EDGE_RELATIONS and unchanged(e.get("source_file", ""))]
+    inc = extract([root / c for c in changed], root=root, parallel=False,
+                  resolution_context_nodes=ctx_nodes, resolution_context_edges=ctx_edges)
+    return full, inc
+
+
+_INC_SVC_PATH = "force-app/main/default/classes/Svc.cls"
+_INC_TEST_PATH = "force-app/main/default/classes/SvcTest.cls"
+_INC_SVC = ("public class Svc {\n  public static void run(Object o) {\n"
+            "    o.Revenue_Period__c = 2;\n    rec.Region__c = 'x';\n  }\n}\n")
+_INC_TEST = ("@isTest\nprivate class SvcTest {\n  @isTest\n  static void t() {\n"
+             "    Svc.run(null);\n    System.assert(true);\n  }\n}\n")
+
+
+def test_incremental_run_applies_resolver_removals_and_remaps(tmp_path):
+    full, inc = _incremental(
+        tmp_path, {_INC_SVC_PATH: _INC_SVC, _INC_TEST_PATH: _INC_TEST},
+        [_INC_SVC_PATH, _INC_TEST_PATH])
+    region = [n["id"] for n in full["nodes"] if n["label"] == "Account.Region__c"]
+    assert len(region) == 1
+    labels = {n["label"] for n in inc["nodes"]}
+    # ambiguous Revenue_Period__c is dropped, the unique Region__c is remapped
+    assert not [lab for lab in labels if lab.startswith("*.")]
+    assert "Account.Region__c" not in labels  # no orphan stub left in the fresh nodes
+    field_edges = [e for e in inc["edges"] if e["relation"] in ("writes_field", "reads_field")]
+    assert [e["target"] for e in field_edges] == region
+    # `tests -> System` is pruned; the Svc class stays covered
+    by_id = {n["id"]: n["label"] for n in inc["nodes"]}
+    assert "System" not in labels
+    assert [by_id[e["target"]] for e in inc["edges"] if e["relation"] == "tests"] == ["Svc"]
+
+
+def test_incremental_formula_hop_resolves_through_context(tmp_path):
+    changed = "force-app/main/default/objects/Account/fields/Region_Label__c.field-meta.xml"
+    full, inc = _incremental(tmp_path, {}, [changed])
+    region = [n["id"] for n in full["nodes"] if n["label"] == "Account.Region__c"]
+    assert len(region) == 1
+    assert region[0] in {e["target"] for e in inc["edges"] if e["relation"] == "reads_field"}
+    assert not [n for n in inc["nodes"] if n["label"] == "Account.Parent__r.Region__c"]
+
+
+def test_context_edge_relations_cover_lookup_edges():
+    from graphify.resolver_registry import CONTEXT_EDGE_RELATIONS
+    assert {"contains", "method", "looks_up_to", "master_detail_to"} <= set(CONTEXT_EDGE_RELATIONS)

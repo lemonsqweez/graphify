@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
+from graphify.resolver_registry import CONTEXT_EDGE_RELATIONS
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
@@ -4360,9 +4361,7 @@ def dispatch_command(cmd: str) -> None:
                     for _edge in _ctx_graph.get(
                         "links", _ctx_graph.get("edges", [])
                     ):
-                        if _edge.get("relation") not in (
-                            "contains", "method", "inherits", "imports", "imports_from"
-                        ):
+                        if _edge.get("relation") not in CONTEXT_EDGE_RELATIONS:
                             continue
                         if not _ctx_is_ast_tier(_edge):
                             continue

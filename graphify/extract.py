@@ -10795,10 +10795,32 @@ def extract(
     if resolution_context_nodes or resolution_context_edges:
         _rl_nodes = list(resolution_nodes)
         _rl_edges = all_edges + list(resolution_context_edges or [])
-        _n0, _e0 = len(_rl_nodes), len(_rl_edges)
+        # Most resolvers only append, but some (Salesforce) also remove and remap.
+        # Track the scratch lists by object identity so removals of FRESH nodes and
+        # edges apply here too, and appended items are exactly the ones that were
+        # not in the lists before (indices shift once anything is removed).
+        _nodes_in = {id(n) for n in _rl_nodes}
+        _edges_in = {id(e) for e in _rl_edges}
         run_language_resolvers(paths, per_file, _rl_nodes, _rl_edges)
-        all_nodes.extend(_rl_nodes[_n0:])
-        all_edges.extend(_rl_edges[_e0:])
+        _nodes_out = {id(n) for n in _rl_nodes}
+        _edges_out = {id(e) for e in _rl_edges}
+        # A resolver that rebuilds a list from copies must not leak the read-only
+        # context into the output: items that merely re-create a context node/edge
+        # are ignored.
+        _ctx_node_ids = {n.get("id") for n in resolution_context_nodes or []}
+        _ctx_edge_keys = {
+            (e.get("source"), e.get("target"), e.get("relation"), e.get("source_file"))
+            for e in resolution_context_edges or []
+        }
+        all_nodes[:] = [n for n in all_nodes if id(n) in _nodes_out]
+        all_edges[:] = [e for e in all_edges if id(e) in _edges_out]
+        all_nodes.extend(n for n in _rl_nodes
+                         if id(n) not in _nodes_in and n.get("id") not in _ctx_node_ids)
+        all_edges.extend(
+            e for e in _rl_edges
+            if id(e) not in _edges_in
+            and (e.get("source"), e.get("target"), e.get("relation"), e.get("source_file"))
+            not in _ctx_edge_keys)
     else:
         run_language_resolvers(paths, per_file, all_nodes, all_edges)
 

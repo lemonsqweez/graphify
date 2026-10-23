@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from graphify.resolver_registry import CONTEXT_EDGE_RELATIONS
+
 # Single source of truth in graphify.paths (#1423); re-exported as _GRAPHIFY_OUT.
 from graphify.paths import (
     GRAPHIFY_OUT as _GRAPHIFY_OUT,
@@ -2074,9 +2076,7 @@ def _rebuild_code(
                 # edges come too: a TS field inherited from an unchanged file is
                 # typed by that file's imports, as in a full build.
                 for edge in ctx_graph.get("links", ctx_graph.get("edges", [])):
-                    if edge.get("relation") not in (
-                        "contains", "method", "inherits", "imports", "imports_from"
-                    ):
+                    if edge.get("relation") not in CONTEXT_EDGE_RELATIONS:
                         continue
                     if not _is_ast_tier(edge):
                         continue
