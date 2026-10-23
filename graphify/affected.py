@@ -38,8 +38,9 @@ DEFAULT_AFFECTED_RELATIONS = (
     "defines",
     "requires",
     # Salesforce (SFDX) relations: field-level reads/writes, SOQL, automation,
-    # schema links, LWC->Apex calls and test coverage, so `affected Obj.Field`
-    # reaches the code, flows and tests that touch it.
+    # schema links, flow/LWC->Apex calls, quick action->flow and Lightning
+    # page/LWC composition, and test coverage, so `affected Obj.Field` reaches
+    # the code, flows, UI and tests that touch it.
     "queries",
     "writes_field",
     "reads_field",
@@ -48,6 +49,8 @@ DEFAULT_AFFECTED_RELATIONS = (
     "looks_up_to",
     "master_detail_to",
     "calls_apex",
+    "calls_flow",
+    "uses_component",
     "tests",
 )
 

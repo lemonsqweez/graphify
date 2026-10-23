@@ -388,6 +388,57 @@ def _real(ext, label, suffix):
     return nodes[0]
 
 
+def _pairs(ext, relation):
+    by_id = {n["id"]: n for n in ext["nodes"]}
+    return {(by_id[e["source"]]["label"], by_id[e["target"]]["label"]) for e in _edges(ext, relation)}
+
+
+def test_quick_action_calls_flow(tmp_path):
+    ext, _ = build_sfdx(tmp_path)
+    action = _real(ext, "Opportunity.Restamp", ".quickAction-meta.xml")
+    flow = _real(ext, "Stamp_Region", ".flow-meta.xml")
+    assert [e["target"] for e in _edges(ext, "calls_flow") if e["source"] == action["id"]] == [flow["id"]]
+    opp = {n["id"] for n in _by_label(ext, "Opportunity")}
+    assert len(opp) == 1
+    assert opp <= {e["target"] for e in _edges(ext, "references") if e["source"] == action["id"]}
+
+
+def test_permset_grants_flow_and_group_includes_permset(tmp_path):
+    ext, _ = build_sfdx(tmp_path)
+    assert _pairs(ext, "grants_flow") == {("Fundraising_Full_Access", "Stamp_Region")}
+    assert _pairs(ext, "includes_permset") == {("Fundraising_Managers", "Fundraising_Full_Access")}
+    _real(ext, "Fundraising_Full_Access", ".permissionset-meta.xml")
+    assert len(_by_label(ext, "Stamp_Region")) == 1
+
+
+_LWC_JS = "import { LightningElement } from 'lwc';\nexport default class %s extends LightningElement {}\n"
+
+
+def test_flexipage_uses_lwc(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/lwc/revenueDashboard/revenueDashboard.js": _LWC_JS % "RevenueDashboard"})
+    assert _pairs(ext, "uses_component") == {("Revenue_Home", "revenueDashboard.js")}
+
+
+def test_flexipage_unknown_component_dropped(tmp_path):
+    ext, _ = build_sfdx(tmp_path)
+    assert not _edges(ext, "uses_component")
+    assert not _by_label(ext, "c:revenueDashboard")
+    assert _by_label(ext, "Revenue_Home")
+
+
+def test_lwc_template_uses_child_component(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/lwc/revenueDashboard/revenueDashboard.js": _LWC_JS % "RevenueDashboard",
+        "force-app/main/default/lwc/revenueDashboard/revenueDashboard.html":
+            "<template><c-kpi-tile value={total}></c-kpi-tile><c-missing-thing></c-missing-thing>"
+            "<lightning-card></lightning-card></template>\n",
+        "force-app/main/default/lwc/kpiTile/kpiTile.js": _LWC_JS % "KpiTile",
+    })
+    assert ("revenueDashboard.js", "kpiTile.js") in _pairs(ext, "uses_component")
+    assert {t for s, t in _pairs(ext, "uses_component") if s == "revenueDashboard.js"} == {"kpiTile.js"}
+
+
 def test_validation_rule_and_flow_active_attrs():
     rule = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
     assert next(n for n in rule["nodes"] if n["id"] == make_id("Account", "vr", "Region_Required"))["active"] is True
@@ -400,7 +451,8 @@ def test_validation_rule_and_flow_active_attrs():
 def test_affected_includes_sf_relations():
     from graphify.affected import DEFAULT_AFFECTED_RELATIONS
     for rel in ("queries", "writes_field", "reads_field", "triggers_on", "has_field",
-                "looks_up_to", "master_detail_to", "calls_apex", "tests"):
+                "looks_up_to", "master_detail_to", "calls_apex", "calls_flow",
+                "uses_component", "tests"):
         assert rel in DEFAULT_AFFECTED_RELATIONS, rel
 
 
@@ -464,6 +516,27 @@ def test_incremental_formula_hop_resolves_through_context(tmp_path):
     assert len(region) == 1
     assert region[0] in {e["target"] for e in inc["edges"] if e["relation"] == "reads_field"}
     assert not [n for n in inc["nodes"] if n["label"] == "Account.Parent__r.Region__c"]
+
+
+_INC_LWC = {
+    "force-app/main/default/lwc/revenueDashboard/revenueDashboard.js": _LWC_JS % "RevenueDashboard",
+    "force-app/main/default/lwc/revenueDashboard/revenueDashboard.html":
+        "<template><c-kpi-tile></c-kpi-tile></template>\n",
+    "force-app/main/default/lwc/kpiTile/kpiTile.js": _LWC_JS % "KpiTile",
+}
+
+
+def test_incremental_flexipage_binds_unchanged_lwc(tmp_path):
+    full, inc = _incremental(tmp_path, _INC_LWC,
+                             ["force-app/main/default/flexipages/Revenue_Home.flexipage-meta.xml"])
+    js = [n["id"] for n in full["nodes"] if n["label"] == "revenueDashboard.js"]
+    assert [e["target"] for e in inc["edges"] if e["relation"] == "uses_component"] == js
+    assert not [n for n in inc["nodes"] if n["label"].startswith("c:")]
+
+
+def test_incremental_unchanged_lwc_bundle_not_reemitted(tmp_path):
+    _, inc = _incremental(tmp_path, {**_INC_LWC, _INC_SVC_PATH: _INC_SVC}, [_INC_SVC_PATH])
+    assert not [e for e in inc["edges"] if e["relation"] == "uses_component"]
 
 
 def test_context_edge_relations_cover_lookup_edges():

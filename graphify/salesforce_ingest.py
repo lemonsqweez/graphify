@@ -9,12 +9,14 @@ the schema it touches.
 Handles: object (incl. legacy inline fields/rules); field (Lookup / MasterDetail
 relationships, formulas, roll-up summaries); flow (record-trigger object,
 referenced objects, field reads/writes, invocable Apex actions);
-validationRule; recordType; permissionset (field, object, record type and Apex
-class grants); DLRS rollups. Relation vocabulary: ``has_field``,
-``looks_up_to``, ``master_detail_to``, ``triggers_on``, ``references``,
-``validates``, ``reads_field``, ``writes_field``, ``has_record_type``,
-``calls_apex``, ``grants_fls``, ``grants_access``, ``grants_record_type``,
-``grants_apex``.
+validationRule; recordType; permissionset (field, object, record type, Apex
+class and flow grants); permissionsetgroup; quickAction; flexipage; DLRS
+rollups. Relation vocabulary: ``has_field``, ``looks_up_to``,
+``master_detail_to``, ``triggers_on``, ``references``, ``validates``,
+``reads_field``, ``writes_field``, ``has_record_type``, ``calls_apex``,
+``calls_flow``, ``uses_component``, ``grants_fls``, ``grants_access``,
+``grants_record_type``, ``grants_apex``, ``grants_flow``,
+``includes_permset``.
 
 Code-sidecar metadata (``.cls-meta.xml``, ``.trigger-meta.xml``,
 ``.js-meta.xml``) is intentionally not matched — the companion source file
@@ -36,6 +38,9 @@ SF_METADATA_SUFFIXES = (
     ".validationRule-meta.xml",
     ".permissionset-meta.xml",
     ".recordType-meta.xml",
+    ".quickAction-meta.xml",
+    ".flexipage-meta.xml",
+    ".permissionsetgroup-meta.xml",
 )
 
 # Only DLRS rollup records are custom metadata worth parsing; other CMDT types
@@ -145,6 +150,13 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
             "confidence": "EXTRACTED", "source_file": str_path,
             "source_location": None, "weight": 1.0, **attrs,
         })
+
+    def named_ref(kind: str, api: str) -> str:
+        # Stub for a flow / permission set defined in its own file; folded into
+        # that definition by label in resolve_salesforce_references.
+        nid = make_id(kind, api)
+        add_node(nid, api, stub=True)
+        return nid
 
     def field_node(obj_api: str, field_api: str, stub: bool) -> str:
         f_nid = make_id(obj_api, field_api)
@@ -356,6 +368,43 @@ def extract_salesforce_metadata(path: Path) -> dict[str, Any]:
                 cls_nid = make_id(cls_api)
                 add_node(cls_nid, cls_api, stub=True)  # the generic rewire folds it into the class
                 add_edge(ps_nid, cls_nid, "grants_apex")
+        for fa in _find_all(root, "flowAccesses"):
+            flow_api = _child_text(fa, "flow")
+            if flow_api and _child_text(fa, "enabled") == "true":
+                add_edge(ps_nid, named_ref("flow", flow_api), "grants_flow")
+
+    # PERMISSION SET GROUP: permissionsetgroups/<G>.permissionsetgroup-meta.xml
+    elif name.endswith(".permissionsetgroup-meta.xml"):
+        group_nid = make_id("permsetgroup", strip_suffix(".permissionsetgroup-meta.xml"))
+        add_node(group_nid, strip_suffix(".permissionsetgroup-meta.xml"))
+        for ps in _find_all(root, "permissionSets"):
+            ps_api = (ps.text or "").strip()
+            if ps_api:
+                add_edge(group_nid, named_ref("permset", ps_api), "includes_permset")
+
+    # QUICK ACTION: quickActions/<Obj>.<Action>.quickAction-meta.xml (global
+    # actions have no object prefix)
+    elif name.endswith(".quickAction-meta.xml"):
+        action_api = strip_suffix(".quickAction-meta.xml")
+        action_nid = make_id("quickaction", action_api)
+        add_node(action_nid, action_api)
+        if "." in action_api:
+            add_edge(action_nid, obj_ref(action_api.split(".", 1)[0]), "references")
+        flow_api = _child_text(root, "flowDefinition")
+        if flow_api:
+            add_edge(action_nid, named_ref("flow", flow_api), "calls_flow")
+
+    # LIGHTNING PAGE: flexipages/<Page>.flexipage-meta.xml. Custom components
+    # (`c:name`) become stubs that _link_lwc_components binds to the LWC bundle.
+    elif name.endswith(".flexipage-meta.xml"):
+        page_nid = make_id("flexipage", strip_suffix(".flexipage-meta.xml"))
+        add_node(page_nid, strip_suffix(".flexipage-meta.xml"))
+        for el in root.iter():
+            comp = (el.text or "").strip() if _local(el.tag) == "componentName" else ""
+            if comp.startswith("c:") and len(comp) > 2:
+                lwc_nid = make_id("lwc", comp[2:])
+                add_node(lwc_nid, comp, stub=True)
+                add_edge(page_nid, lwc_nid, "uses_component")
 
     # RECORD TYPE: objects/<Obj>/recordTypes/<RT>.recordType-meta.xml
     elif name.endswith(".recordType-meta.xml"):
@@ -492,6 +541,78 @@ def _link_lwc_to_apex(all_nodes: list[dict], all_edges: list[dict]) -> None:
     all_edges.extend(new_edges)
 
 
+_LWC_CHILD_TAG_RE = re.compile(r"<c-([a-z0-9]+(?:-[a-z0-9]+)*)[\s/>]")
+
+
+def _link_lwc_components(all_nodes: list[dict], all_edges: list[dict],
+                         fresh_ids: set[str]) -> None:
+    """Bind ``c:name`` component stubs to their LWC bundle and add LWC composition.
+
+    A bundle is represented by its ``name.js`` file node. Flexipage stubs that
+    match exactly one bundle are rewired to it, others dropped. A bundle whose
+    ``name.html`` template renders ``<c-child-name>`` gets ``uses_component`` to
+    the ``childName.js`` node (the template itself is not extracted, so it is
+    read beside the ``.js`` path recorded on that file's edges). Only bundles in
+    ``fresh_ids`` are read, so an incremental run never re-emits the edges of an
+    unchanged bundle that reached it as context."""
+    bundles: dict[str, list[dict]] = {}
+    for node in all_nodes:
+        label = str(node.get("label", ""))
+        if node.get("source_file") and label.endswith(".js"):
+            bundles.setdefault(label[:-3].casefold(), []).append(node)
+
+    def bundle(name: str) -> dict | None:
+        cands = bundles.get(name.casefold(), [])
+        return cands[0] if len(cands) == 1 else None
+
+    remap: dict[str, str] = {}
+    dropped: set[str] = set()
+    for node in all_nodes:
+        label = str(node.get("label", ""))
+        if node.get("source_file") or not label.startswith("c:"):
+            continue
+        target = bundle(label[2:])
+        if target is not None:
+            remap[str(node["id"])] = str(target["id"])
+        else:
+            dropped.add(str(node["id"]))
+
+    js_paths: dict[str, str] = {}
+    for edge in all_edges:
+        src_file = str(edge.get("source_file") or "")
+        if src_file.endswith(".js") and "__tests__" not in Path(src_file).parts:
+            js_paths.setdefault(str(edge.get("source")), src_file)
+    new_edges: list[dict] = []
+    for name, nodes in bundles.items():
+        nid = str(nodes[0]["id"])
+        if len(nodes) != 1 or nid not in js_paths or nid not in fresh_ids:
+            continue
+        js_path = Path(js_paths[nid])
+        if js_path.parent.name.casefold() != name:
+            continue
+        try:
+            html = js_path.with_suffix(".html").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for tag in dict.fromkeys(_LWC_CHILD_TAG_RE.findall(html)):
+            first, *rest = tag.split("-")
+            child = bundle(first + "".join(p[:1].upper() + p[1:] for p in rest))
+            if child is not None and child is not nodes[0]:
+                new_edges.append({
+                    "source": nodes[0]["id"], "target": child["id"], "relation": "uses_component",
+                    "confidence": "EXTRACTED", "source_file": str(js_path.with_suffix(".html")),
+                    "source_location": None, "weight": 1.0,
+                })
+    if remap or dropped:
+        all_nodes[:] = [n for n in all_nodes
+                        if str(n.get("id")) not in remap and str(n.get("id")) not in dropped]
+        all_edges[:] = [e for e in all_edges
+                        if e.get("source") not in dropped and e.get("target") not in dropped]
+        for edge in all_edges:
+            edge["target"] = remap.get(edge.get("target"), edge.get("target"))
+    all_edges.extend(new_edges)
+
+
 def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
                                   all_edges: list[dict]) -> None:
     """Fold sourceless SObject/field stubs into their ``*-meta.xml`` definitions.
@@ -506,6 +627,8 @@ def resolve_salesforce_references(per_file: list[dict], all_nodes: list[dict],
     when that definition is unique.
     """
     _link_lwc_to_apex(all_nodes, all_edges)
+    _link_lwc_components(all_nodes, all_edges,
+                         {str(n.get("id")) for r in per_file for n in r.get("nodes", [])})
     _prune_unresolved_apex_edges(all_nodes, all_edges)
     real_by_label: dict[str, list[dict]] = {}
     for node in all_nodes:

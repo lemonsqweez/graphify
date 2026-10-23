@@ -17,5 +17,9 @@
         <apexClass>PaymentWorkspaceController</apexClass>
         <enabled>true</enabled>
     </classAccesses>
+    <flowAccesses>
+        <enabled>true</enabled>
+        <flow>Stamp_Region</flow>
+    </flowAccesses>
     <label>Fundraising Full Access</label>
 </PermissionSet>
