@@ -271,7 +271,7 @@ def extract_apex(path: Path) -> dict:
                 if base_nid not in seen_ids:
                     base_nid = _make_id(base)
                 if base_nid not in seen_ids:
-                    add_node(base_nid, base, lineno)
+                    add_node(base_nid, base, lineno, stub=True)
                 add_edge(class_nid, base_nid, "extends", lineno, confidence="INFERRED")
             if cm.group(3):
                 for iface in cm.group(3).split(","):
@@ -281,11 +281,16 @@ def extract_apex(path: Path) -> dict:
                         if iface_nid not in seen_ids:
                             iface_nid = _make_id(iface)
                         if iface_nid not in seen_ids:
-                            add_node(iface_nid, iface, lineno)
+                            add_node(iface_nid, iface, lineno, stub=True)
                         add_edge(class_nid, iface_nid, "implements", lineno, confidence="INFERRED")
-            class_stack.append([class_nid, depth_before[lineno], False, prev_test])
-            current_class_nid = class_nid
-            current_method_nid, method_scope = None, None
+            # A one-line body (`class XException extends Exception {}`) opens no
+            # scope; pushing it would capture every later member of the outer class.
+            if "{" in stripped and depth_before[lineno + 1] <= depth_before[lineno]:
+                test_class_nid, test_class_name = prev_test
+            else:
+                class_stack.append([class_nid, depth_before[lineno], False, prev_test])
+                current_class_nid = class_nid
+                current_method_nid, method_scope = None, None
             pending_annotations = []
             continue
 
@@ -308,7 +313,7 @@ def extract_apex(path: Path) -> dict:
                         if parent_nid not in seen_ids:
                             parent_nid = _make_id(parent)
                         if parent_nid not in seen_ids:
-                            add_node(parent_nid, parent, lineno)
+                            add_node(parent_nid, parent, lineno, stub=True)
                         add_edge(iface_nid, parent_nid, "extends", lineno, confidence="INFERRED")
             pending_annotations = []
             continue
@@ -480,5 +485,28 @@ def extract_apex(path: Path) -> dict:
 
     for (src, tgt), (relation, ln) in field_edges.items():
         add_edge(src, tgt, relation, ln, confidence="INFERRED")
+
+    # --- Class-to-class dependencies ------------------------------------------
+    # Every capitalized identifier a class or trigger body mentions (static
+    # call, `new`, declaration, generic argument) is a candidate Apex type. The
+    # stubs that don't fold into an Apex class (System, String, SObjects, SOQL
+    # keywords) are pruned by resolve_salesforce_references. Test classes are
+    # covered by `tests` instead; types declared in this file are not deps.
+    declared = {n["label"] for n in nodes if n["source_file"] and n["id"] != file_nid
+                and not n["label"].startswith(".")}
+    test_owners = {n["id"] for n in nodes if n.get("is_test")}
+    seen_uses: set[tuple[str, str]] = set()
+    for um in _re.finditer(r"(?<![\w.])([A-Z]\w*)", code_only):
+        name = um.group(1)
+        if name in declared or "__" in name or in_soql(um.start()):
+            continue
+        ln = source.count("\n", 0, um.start()) + 1
+        owner = line_owner[min(ln, len(line_owner) - 1)]
+        if owner == file_nid or owner in test_owners or (owner, name) in seen_uses:
+            continue
+        seen_uses.add((owner, name))
+        u_nid = _make_id(name)
+        add_node(u_nid, name, ln, stub=True)
+        add_edge(owner, u_nid, "uses", ln, confidence="INFERRED")
 
     return {"nodes": nodes, "edges": edges}

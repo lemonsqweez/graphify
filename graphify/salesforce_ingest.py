@@ -459,10 +459,11 @@ _APEX_TARGET_RELATIONS = frozenset({"tests", "calls_apex"})
 
 
 def _prune_unresolved_apex_edges(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    """Keep a ``tests`` / ``calls_apex`` edge only when it lands on Apex code.
+    """Keep a ``tests`` / ``calls_apex`` / Apex ``uses`` edge only when it lands on Apex code.
 
     ``extract_apex`` emits a ``tests`` edge per capitalized type a test class
-    touches, and a flow emits ``calls_apex`` per invocable action. After the
+    touches and a ``uses`` edge per one any other class or trigger mentions, and
+    a flow emits ``calls_apex`` per invocable action. After the
     generic stub rewire those naming real Apex classes point at the class node,
     while ``System``/``Test``, SObjects (``new Account(...)``) and actions whose
     class is not in the project are not, so their edges are dropped, and then
@@ -475,7 +476,10 @@ def _prune_unresolved_apex_edges(all_nodes: list[dict], all_edges: list[dict]) -
     dropped_targets: set[str] = set()
     kept: list[dict] = []
     for edge in all_edges:
-        if edge.get("relation") in _APEX_TARGET_RELATIONS and not is_apex(by_id.get(str(edge.get("target")))):
+        relation = edge.get("relation")
+        apex_only = relation in _APEX_TARGET_RELATIONS or (
+            relation == "uses" and str(edge.get("source_file") or "").endswith((".cls", ".trigger")))
+        if apex_only and not is_apex(by_id.get(str(edge.get("target")))):
             dropped_targets.add(str(edge.get("target")))
             continue
         kept.append(edge)

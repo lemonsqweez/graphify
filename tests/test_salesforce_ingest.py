@@ -439,6 +439,56 @@ def test_lwc_template_uses_child_component(tmp_path):
     assert {t for s, t in _pairs(ext, "uses_component") if s == "revenueDashboard.js"} == {"kpiTile.js"}
 
 
+_USES_FILES = {
+    "force-app/main/default/classes/Handler.cls": _HANDLER_CLS,
+    "force-app/main/default/classes/Helper.cls": "public class Helper {\n  public Helper() {}\n}\n",
+    "force-app/main/default/classes/Dto.cls": "public class Dto {\n}\n",
+    "force-app/main/default/classes/Orchestrator.cls": (
+        "public with sharing class Orchestrator {\n"
+        "  // Ghost.run() is commented out\n"
+        "  public void go(List<Dto> rows) {\n"
+        "    Handler.run();\n    Helper h = new Helper();\n"
+        "    Account a = new Account(Name = 'Helper');\n"
+        "    String s = String.valueOf(a);\n    System.debug(Step.ONE);\n  }\n"
+        "  public enum Step { ONE }\n}\n"),
+    "force-app/main/default/triggers/AccountTrigger.trigger": (
+        "trigger AccountTrigger on Account (before insert) {\n    Handler.run();\n}\n"),
+    "force-app/main/default/classes/HandlerTest.cls": _HANDLER_TEST_CLS,
+}
+
+
+def test_apex_class_uses_other_classes(tmp_path):
+    ext, _ = build_sfdx(tmp_path, _USES_FILES)
+    uses = _pairs(ext, "uses")
+    assert {t for s, t in uses if s == "Orchestrator"} == {"Handler", "Helper", "Dto"}
+    assert ("AccountTrigger", "Handler") in uses
+    assert not [s for s, _ in uses if s == "HandlerTest"]
+    for gone in ("System", "String", "Ghost"):
+        assert not _by_label(ext, gone), gone
+
+
+def test_platform_supertypes_are_not_apex_classes(tmp_path):
+    batch = ("public class Rederive implements Database.Batchable<SObject>, Database.Stateful {\n"
+             "  public class RederiveException extends Exception {}\n"
+             "  public void run() {\n    Database.executeBatch(this);\n    Handler.run();\n  }\n}\n")
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/Handler.cls": _HANDLER_CLS,
+        "force-app/main/default/classes/Rederive.cls": batch,
+    })
+    assert not [n for n in _by_label(ext, "Database") + _by_label(ext, "Exception")
+                if n.get("source_file")]
+    assert {t for s, t in _pairs(ext, "uses") if s == "Rederive"} == {"Handler"}
+
+
+def test_extends_resolves_to_class_in_other_file(tmp_path):
+    ext, _ = build_sfdx(tmp_path, {
+        "force-app/main/default/classes/BaseSvc.cls": "public virtual class BaseSvc {\n}\n",
+        "force-app/main/default/classes/Svc.cls": "public class Svc extends BaseSvc {\n}\n",
+    })
+    base = _real(ext, "BaseSvc", "BaseSvc.cls")
+    assert [e["target"] for e in _edges(ext, "extends")] == [base["id"]]
+
+
 def test_validation_rule_and_flow_active_attrs():
     rule = _meta("objects/Account/validationRules/Region_Required.validationRule-meta.xml")
     assert next(n for n in rule["nodes"] if n["id"] == make_id("Account", "vr", "Region_Required"))["active"] is True
@@ -537,6 +587,16 @@ def test_incremental_flexipage_binds_unchanged_lwc(tmp_path):
 def test_incremental_unchanged_lwc_bundle_not_reemitted(tmp_path):
     _, inc = _incremental(tmp_path, {**_INC_LWC, _INC_SVC_PATH: _INC_SVC}, [_INC_SVC_PATH])
     assert not [e for e in inc["edges"] if e["relation"] == "uses_component"]
+
+
+def test_incremental_apex_uses_resolves_through_context(tmp_path):
+    orch = "force-app/main/default/classes/Orchestrator.cls"
+    full, inc = _incremental(tmp_path, _USES_FILES, [orch])
+    by_label = {n["label"]: n["id"] for n in full["nodes"]
+                if str(n.get("source_file") or "").endswith(".cls")}
+    targets = {e["target"] for e in inc["edges"] if e["relation"] == "uses"}
+    assert targets == {by_label["Handler"], by_label["Helper"], by_label["Dto"]}
+    assert not [n for n in inc["nodes"] if n["label"] in ("System", "String", "Handler")]
 
 
 def test_context_edge_relations_cover_lookup_edges():
